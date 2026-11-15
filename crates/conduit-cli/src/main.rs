@@ -119,7 +119,11 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 pub enum ServiceCmd {
-    Install,
+    Install {
+        /// Do not start the TUN device (control.sock + sessions only).
+        #[arg(long)]
+        no_tun: bool,
+    },
     Uninstall,
     Status,
 }
@@ -409,7 +413,7 @@ async fn cmd_setup(
     store.save_account(info)?;
 
     if install {
-        service::cmd_service(data_dir, ServiceCmd::Install).await?;
+        service::cmd_service(data_dir, ServiceCmd::Install { no_tun: true }).await?;
     } else {
         println!(
             "start the node with `conduit run`, or `conduit service install` for autostart"

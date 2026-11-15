@@ -12,9 +12,9 @@ pub const LAUNCHD_LABEL: &str = "com.conduit.node";
 /// CLI entry point for `conduit service ...`.
 pub async fn cmd_service(data_dir: std::path::PathBuf, cmd: crate::ServiceCmd) -> Result<()> {
     match cmd {
-        crate::ServiceCmd::Install => {
+        crate::ServiceCmd::Install { no_tun } => {
             let exe = std::env::current_exe().context("locate current executable")?;
-            println!("{}", install(&exe, &data_dir)?);
+            println!("{}", install(&exe, &data_dir, no_tun)?);
         }
         crate::ServiceCmd::Uninstall => println!("{}", uninstall()?),
         crate::ServiceCmd::Status => println!("{}", status_line()),
@@ -44,21 +44,27 @@ pub fn launchd_plist_path() -> Result<std::path::PathBuf> {
         .join(format!("{LAUNCHD_LABEL}.plist")))
 }
 
-pub fn systemd_unit(exe: &Path, data_dir: &Path) -> String {
+pub fn systemd_unit(exe: &Path, data_dir: &Path, no_tun: bool) -> String {
     format!(
         "[Unit]\nDescription=Conduit node\nAfter=network-online.target\n\n\
-         [Service]\nExecStart={} --data-dir {} run\nRestart=on-failure\nRestartSec=5\n\n\
+         [Service]\nExecStart={} --data-dir {} run{}\nRestart=on-failure\nRestartSec=5\n\n\
          [Install]\nWantedBy=default.target\n",
         exe.display(),
-        data_dir.display()
+        data_dir.display(),
+        if no_tun { " --no-tun" } else { "" }
     )
 }
 
-pub fn launchd_plist(exe: &Path, data_dir: &Path) -> String {
+pub fn launchd_plist(exe: &Path, data_dir: &Path, no_tun: bool) -> String {
     let (exe, dir) = (
         xml_escape(&exe.display().to_string()),
         xml_escape(&data_dir.display().to_string()),
     );
+    let tun_arg = if no_tun {
+        "\x20   <string>--no-tun</string>\n"
+    } else {
+        ""
+    };
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
@@ -71,6 +77,7 @@ pub fn launchd_plist(exe: &Path, data_dir: &Path) -> String {
          \x20   <string>--data-dir</string>\n\
          \x20   <string>{dir}</string>\n\
          \x20   <string>run</string>\n\
+         {tun_arg}\
          \x20 </array>\n\
          \x20 <key>RunAtLoad</key><true/>\n\
          \x20 <key>KeepAlive</key><true/>\n\
@@ -97,11 +104,11 @@ fn run(cmd: &mut std::process::Command) -> Result<()> {
     }
 }
 
-pub fn install(exe: &Path, data_dir: &Path) -> Result<String> {
+pub fn install(exe: &Path, data_dir: &Path, no_tun: bool) -> Result<String> {
     if cfg!(target_os = "macos") {
         let path = launchd_plist_path()?;
         conduit_core::ensure_parent(&path)?;
-        std::fs::write(&path, launchd_plist(exe, data_dir))?;
+        std::fs::write(&path, launchd_plist(exe, data_dir, no_tun))?;
         let _ = run(std::process::Command::new("launchctl")
             .args(["unload", &path.display().to_string()]));
         run(std::process::Command::new("launchctl").args(["load", "-w", &path.display().to_string()]))?;
@@ -109,7 +116,7 @@ pub fn install(exe: &Path, data_dir: &Path) -> Result<String> {
     } else {
         let path = systemd_unit_path()?;
         conduit_core::ensure_parent(&path)?;
-        std::fs::write(&path, systemd_unit(exe, data_dir))?;
+        std::fs::write(&path, systemd_unit(exe, data_dir, no_tun))?;
         run(std::process::Command::new("systemctl").args(["--user", "daemon-reload"]))?;
         run(std::process::Command::new("systemctl").args([
             "--user",
@@ -175,14 +182,16 @@ mod tests {
     fn unit_and_plist_carry_exe_and_data_dir() {
         let exe = Path::new("/usr/local/bin/conduit");
         let dir = Path::new("/home/u/.conduit");
-        let unit = systemd_unit(exe, dir);
+        let unit = systemd_unit(exe, dir, false);
         assert!(unit.contains("ExecStart=/usr/local/bin/conduit --data-dir /home/u/.conduit run"));
         assert!(unit.contains("Restart=on-failure"));
+        assert!(systemd_unit(exe, dir, true).contains("run --no-tun"));
 
-        let plist = launchd_plist(exe, dir);
+        let plist = launchd_plist(exe, dir, false);
         assert!(plist.contains("<string>/usr/local/bin/conduit</string>"));
         assert!(plist.contains("<string>/home/u/.conduit</string>"));
         assert!(plist.contains("<string>run</string>"));
+        assert!(launchd_plist(exe, dir, true).contains("<string>--no-tun</string>"));
         assert!(plist.contains(&format!("<string>{LAUNCHD_LABEL}</string>")));
         assert!(plist.starts_with("<?xml"));
     }
