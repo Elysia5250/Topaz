@@ -1,0 +1,17 @@
+[package]
+name = "conduit-vpn"
+description = "L3 TUN virtual network data plane and *.conduit local DNS for Conduit (Linux & macOS)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+conduit-fabric = { path = "../conduit-fabric" }
+conduit-proto = { path = "../conduit-proto" }
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tun-rs.workspace = true
