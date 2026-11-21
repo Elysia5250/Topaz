@@ -35,7 +35,7 @@ jobs:
             asset_suffix: linux-aarch64
             musl: true
             build_coord: true
-          - os: macos-14
+          - os: macos-latest
             target: aarch64-apple-darwin
             asset_suffix: macos-aarch64
             musl: false
