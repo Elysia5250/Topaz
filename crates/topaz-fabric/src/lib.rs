@@ -326,6 +326,7 @@ where
         sessions: Vec::new(),
         pending_opens: HashMap::new(),
         dial_in_flight: HashSet::new(),
+        relay_in_flight: HashSet::new(),
         dial_backoff: HashMap::new(),
         probing: HashSet::new(),
         punching: Arc::new(Mutex::new(HashSet::new())),

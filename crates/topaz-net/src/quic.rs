@@ -198,13 +198,16 @@ impl QuicEndpoint {
             Ok(clone) => {
                 // dual_stack_udp leaves the socket nonblocking for quinn; a
                 // nonblocking clone would report WouldBlock before any reply
-                // could arrive, so flip the clone back to blocking first.
+                // could arrive, so flip to blocking for the probe and always
+                // restore nonblocking afterwards (Unix clones share O_NONBLOCK).
                 let _ = clone.set_nonblocking(false);
-                match crate::stun::probe_with_timeout(
+                let res = crate::stun::probe_with_timeout(
                     &clone,
                     server,
                     std::time::Duration::from_secs(2),
-                ) {
+                );
+                let _ = clone.set_nonblocking(true);
+                match res {
                     Ok(mapped) => {
                         info!(%server, %mapped, "stun mapped");
                         Some(mapped)

@@ -83,11 +83,25 @@ pub fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, contents).with_context(|| format!("write {}", path.display()))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("open {}", path.display()))?;
+        f.write_all(contents)
+            .with_context(|| format!("write {}", path.display()))?;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        crate::store::chown_to_sudo_user(path);
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents).with_context(|| format!("write {}", path.display()))?;
     }
     Ok(())
 }

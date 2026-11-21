@@ -79,6 +79,7 @@ pub async fn spawn_detached(
         .append(true)
         .open(&log_path)
         .with_context(|| format!("open log file {}", log_path.display()))?;
+    topaz_core::chown_to_sudo_user(&log_path);
     let log_err = log_out
         .try_clone()
         .context("clone log file handle for stderr")?;
@@ -153,6 +154,14 @@ fn read_log_tail(path: &Path, max_lines: usize) -> String {
     lines[start..].join("\n")
 }
 
+struct SocketGuard(PathBuf);
+
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        crate::control::remove_socket(&self.0);
+    }
+}
+
 pub async fn cmd_run(
     data_dir: PathBuf,
     coord_url: Option<String>,
@@ -163,6 +172,7 @@ pub async fn cmd_run(
     let mut store = Store::open(data_dir)?;
     let control_path = store.control_path();
     let control_listener = crate::control::bind_socket(&control_path).await?;
+    let _socket_guard = SocketGuard(control_path.clone());
     if let Some(u) = coord_url {
         store.config.coord_url = u;
         store.save_config()?;
@@ -269,6 +279,7 @@ pub async fn cmd_run(
 
     let vpn_task = topaz_vpn::spawn(handle.clone(), status.clone(), vpn_status.clone(), vpn_cfg);
 
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let state = Arc::new(crate::control::ControlState {
         store: store.clone(),
         engine: handle,
@@ -280,6 +291,7 @@ pub async fn cmd_run(
         control_lock: tokio::sync::Mutex::new(()),
         pending_adds: std::sync::Mutex::new(std::collections::HashMap::new()),
         started: std::time::Instant::now(),
+        shutdown: shutdown_tx,
     });
     tokio::spawn(async move {
         if let Err(e) = crate::control::serve(control_listener, state).await {
@@ -293,11 +305,20 @@ pub async fn cmd_run(
             info!("shutdown signal; exiting");
             Ok(())
         }
+        _ = async {
+            while !*shutdown_rx.borrow() {
+                if shutdown_rx.changed().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }
+        } => {
+            info!("shutdown requested over control.sock; exiting");
+            Ok(())
+        }
     };
     if let Some(t) = vpn_task {
         t.abort();
     }
-    crate::control::remove_socket(&control_path);
     outcome
 }
 

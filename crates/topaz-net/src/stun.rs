@@ -15,10 +15,17 @@ use topaz_proto::stun::{binding_request, parse_binding_response};
 pub fn probe(socket: &UdpSocket, server: SocketAddr) -> Result<SocketAddr> {
     let mut txn = [0u8; 12];
     let mut buf = [0u8; 256];
+    let per_attempt = socket
+        .read_timeout()?
+        .unwrap_or(Duration::from_secs(2));
     for attempt in 1..=3u8 {
         rand::rngs::OsRng.fill_bytes(&mut txn);
         socket.send_to(&binding_request(&txn), server)?;
+        let deadline = std::time::Instant::now() + per_attempt;
         loop {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
             match socket.recv_from(&mut buf) {
                 // The txn id doubles as the reply's authenticity check: it is
                 // 96 bits of our randomness echoed back. Don't compare the
@@ -28,7 +35,7 @@ pub fn probe(socket: &UdpSocket, server: SocketAddr) -> Result<SocketAddr> {
                     if let Some(mapped) = parse_binding_response(&buf[..n], &txn) {
                         return Ok(mapped);
                     }
-                    // Stray or mismatched packet: keep reading within timeout.
+                    // Stray or mismatched packet: keep reading until deadline.
                 }
                 Err(e)
                     if e.kind() == std::io::ErrorKind::WouldBlock
@@ -53,9 +60,7 @@ pub fn probe_with_timeout(
     let prev = socket.read_timeout()?;
     socket.set_read_timeout(Some(wait))?;
     let out = probe(socket, server);
-    if let Some(p) = prev {
-        socket.set_read_timeout(Some(p))?;
-    }
+    let _ = socket.set_read_timeout(prev);
     out
 }
 

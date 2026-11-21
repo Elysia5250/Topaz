@@ -152,8 +152,8 @@ pub async fn serve_dns(sock: UdpSocket, routes: Arc<RwLock<RouteTable>>) {
                 }
             }
             Err(e) => {
-                warn!(error = %e, "local DNS recv failed");
-                return;
+                warn!(error = %e, "local DNS recv failed; continuing");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         }
     }

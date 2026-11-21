@@ -255,44 +255,72 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (mut sink, mut stream) = ws.split();
-    let (local, mut remote) = tokio::io::duplex(64 * 1024);
-    tokio::spawn(async move {
+    let (local, remote) = tokio::io::duplex(64 * 1024);
+    let (mut remote_r, mut remote_w) = tokio::io::split(remote);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(32);
+
+    // Writer task: exclusively owns the WS sink so reads and writes can never deadlock.
+    let writer = tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if sink.send(msg).await.is_err() {
+                break;
+            }
+        }
+        let _ = sink.send(Message::Close(None)).await;
+    });
+
+    // Outbound pump: duplex -> WS channel.
+    let tx_out = tx.clone();
+    let outbound = tokio::spawn(async move {
         let mut buf = vec![0u8; WS_FRAME];
         loop {
-            tokio::select! {
-                incoming = stream.next() => {
-                    match incoming {
-                        Some(Ok(Message::Binary(b))) => {
-                            if remote.write_all(&b).await.is_err() {
-                                break;
-                            }
-                        }
-                        Some(Ok(Message::Ping(p))) => {
-                            if sink.send(Message::Pong(p)).await.is_err() {
-                                break;
-                            }
-                        }
-                        Some(Ok(Message::Pong(_))) | Some(Ok(Message::Text(_))) | Some(Ok(Message::Frame(_))) => {}
-                        Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-                    }
-                }
-                outgoing = remote.read(&mut buf) => {
-                    match outgoing {
-                        Ok(0) | Err(_) => {
-                            let _ = sink.send(Message::Close(None)).await;
-                            break;
-                        }
-                        Ok(n) => {
-                            if sink.send(Message::Binary(buf[..n].to_vec().into())).await.is_err() {
-                                break;
-                            }
-                        }
+            match remote_r.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx_out
+                        .send(Message::Binary(buf[..n].to_vec().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
                     }
                 }
             }
         }
-        let _ = remote.shutdown().await;
     });
+
+    // Inbound pump: WS stream -> duplex.
+    let tx_in = tx.clone();
+    let inbound = tokio::spawn(async move {
+        while let Some(incoming) = stream.next().await {
+            match incoming {
+                Ok(Message::Binary(b)) => {
+                    if remote_w.write_all(&b).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(Message::Ping(p)) => {
+                    let _ = tx_in.try_send(Message::Pong(p));
+                }
+                Ok(Message::Pong(_)) | Ok(Message::Text(_)) | Ok(Message::Frame(_)) => {}
+                Ok(Message::Close(_)) | Err(_) => break,
+            }
+        }
+        let _ = remote_w.shutdown().await;
+    });
+
+    // Coordinate shutdown: when either direction finishes, tear down the other.
+    drop(tx);
+    tokio::spawn(async move {
+        let mut outbound = outbound;
+        let mut inbound = inbound;
+        tokio::select! {
+            _ = &mut outbound => { inbound.abort(); }
+            _ = &mut inbound => { outbound.abort(); }
+        }
+        let _ = writer.await;
+    });
+
     RelayTunnel::Ws(local)
 }
 

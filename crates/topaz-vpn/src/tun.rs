@@ -123,12 +123,12 @@ pub(crate) async fn run_vpn_loop(
                 }
             }
             Some((peer_id, pkt)) = in_rx.recv() => {
-                let allowed = {
+                let valid_len = {
                     let guard = routes.read().unwrap();
-                    guard.validate_inbound(&peer_id, &pkt)
+                    guard.validate_inbound_len(&peer_id, &pkt)
                 };
-                if allowed {
-                    if let Err(e) = dev.send(&pkt).await {
+                if let Some(n) = valid_len {
+                    if let Err(e) = dev.send(&pkt[..n]).await {
                         debug!(iface = %iface, peer = %peer_id, error = %e, "TUN write failed");
                     }
                 } else {

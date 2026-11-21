@@ -103,10 +103,12 @@ impl DeviceCert {
         .into_bytes()
     }
 
-    /// Ids match their keys and the issuer signature is valid. Does not check
-    /// whether the issuer itself belongs to the account.
+    /// Ids match their keys, name is well-formed, and the issuer signature is valid.
+    /// Does not check whether the issuer itself belongs to the account.
     pub fn self_consistent(&self) -> bool {
-        derive_id_hex(&self.user_pubkey).as_deref() == Some(self.user_id.as_str())
+        self.name.len() <= 128
+            && !self.name.chars().any(|c| c.is_control())
+            && derive_id_hex(&self.user_pubkey).as_deref() == Some(self.user_id.as_str())
             && derive_id_hex(&self.device_pubkey).as_deref() == Some(self.device_id.as_str())
             && verify(&self.issuer_pubkey, &self.signing_bytes(), &self.sig)
     }
@@ -253,17 +255,21 @@ pub fn evaluate(user_pubkey: &str, entries: &[DeviceEntry]) -> DeviceSet {
         .filter(|e| e.cert.user_pubkey == user_pubkey && e.cert.self_consistent())
         .collect();
 
+    // First collect every cert that chains to the root key.
     let mut trusted_keys: HashSet<String> = HashSet::from([user_pubkey.to_string()]);
-    let mut valid: Vec<&DeviceEntry> = Vec::new();
+    let mut all_chained: Vec<&DeviceEntry> = Vec::new();
     loop {
         let mut progressed = false;
         for e in &candidates {
-            if valid.iter().any(|v| v.cert.device_id == e.cert.device_id) {
+            if all_chained
+                .iter()
+                .any(|v| v.cert.device_id == e.cert.device_id)
+            {
                 continue;
             }
             if trusted_keys.contains(&e.cert.issuer_pubkey) {
                 trusted_keys.insert(e.cert.device_pubkey.clone());
-                valid.push(e);
+                all_chained.push(e);
                 progressed = true;
             }
         }
@@ -272,17 +278,80 @@ pub fn evaluate(user_pubkey: &str, entries: &[DeviceEntry]) -> DeviceSet {
         }
     }
 
+    let valid_rev = |e: &DeviceEntry, authorities: &HashSet<String>| -> Option<u64> {
+        let r = e.revocation.as_ref()?;
+        if r.device_id == e.cert.device_id
+            && r.user_id == e.cert.user_id
+            && authorities.contains(&r.issuer_pubkey)
+            && verify(&r.issuer_pubkey, &r.signing_bytes(), &r.sig)
+        {
+            Some(r.issued_at)
+        } else {
+            None
+        }
+    };
+
+    // Determine effective revocations starting from the root key so a device
+    // revoked by root cannot counter-revoke other active devices.
+    let mut revoked_at: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let root_only: HashSet<String> = HashSet::from([user_pubkey.to_string()]);
+    for e in &all_chained {
+        if let Some(ts) = valid_rev(e, &root_only) {
+            revoked_at.insert(e.cert.device_pubkey.clone(), ts);
+        }
+    }
+    loop {
+        let mut authorities: HashSet<String> = HashSet::from([user_pubkey.to_string()]);
+        for e in &all_chained {
+            if !revoked_at.contains_key(&e.cert.device_pubkey) {
+                authorities.insert(e.cert.device_pubkey.clone());
+            }
+        }
+        let mut progressed = false;
+        for e in &all_chained {
+            if revoked_at.contains_key(&e.cert.device_pubkey) {
+                continue;
+            }
+            if let Some(ts) = valid_rev(e, &authorities) {
+                revoked_at.insert(e.cert.device_pubkey.clone(), ts);
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+
+    // Re-evaluate the certificate chain while rejecting any cert issued by a
+    // device at or after its revocation timestamp.
+    let mut valid_keys: HashSet<String> = HashSet::from([user_pubkey.to_string()]);
+    let mut valid: Vec<&DeviceEntry> = Vec::new();
+    loop {
+        let mut progressed = false;
+        for e in &all_chained {
+            if valid.iter().any(|v| v.cert.device_id == e.cert.device_id) {
+                continue;
+            }
+            if !valid_keys.contains(&e.cert.issuer_pubkey) {
+                continue;
+            }
+            if let Some(&rev_ts) = revoked_at.get(&e.cert.issuer_pubkey) {
+                if e.cert.issued_at >= rev_ts {
+                    continue;
+                }
+            }
+            valid_keys.insert(e.cert.device_pubkey.clone());
+            valid.push(e);
+            progressed = true;
+        }
+        if !progressed {
+            break;
+        }
+    }
+
     let active = valid
         .iter()
-        .filter(|e| match &e.revocation {
-            None => true,
-            Some(r) => {
-                !(r.device_id == e.cert.device_id
-                    && r.user_id == e.cert.user_id
-                    && trusted_keys.contains(&r.issuer_pubkey)
-                    && verify(&r.issuer_pubkey, &r.signing_bytes(), &r.sig))
-            }
-        })
+        .filter(|e| !revoked_at.contains_key(&e.cert.device_pubkey))
         .map(|e| e.cert.clone())
         .collect();
 
@@ -422,5 +491,32 @@ mod tests {
         let entry: DeviceEntry = serde_json::from_value(legacy_json).unwrap();
         assert_eq!(entry.virtual_ip, None);
         assert_eq!(entry.dns_name, None);
+    }
+
+    #[test]
+    fn revoked_device_cannot_revoke_peers_or_issue_new_certs() {
+        let root = key(1);
+        let a = key(2);
+        let b = key(3);
+        let c = key(4);
+        let ca = cert(&root, &a, &root); // issued_at = 1
+        let cb = cert(&root, &b, &root); // issued_at = 1
+        // A is revoked by root at issued_at = 2.
+        let rev_a = revoke(&root, &ca, &root);
+        // A tries to counter-revoke B and issue a post-revocation cert for C (issued_at = 3).
+        let fake_rev_b = revoke(&root, &cb, &a);
+        let mut cc = cert(&root, &c, &a);
+        cc.issued_at = 3;
+        cc.sig = hex::encode(a.sign(&cc.signing_bytes()).to_bytes());
+
+        let entries = vec![
+            DeviceEntry::new(ca.clone(), Some(rev_a)),
+            DeviceEntry::new(cb.clone(), Some(fake_rev_b)),
+            DeviceEntry::new(cc.clone(), None),
+        ];
+        let set = evaluate(&pk_hex(&root), &entries);
+        assert!(!set.is_active(&ca.device_id));
+        assert!(set.is_active(&cb.device_id), "revoked A must not revoke active B");
+        assert!(!set.is_active(&cc.device_id), "post-revocation cert by A must be rejected");
     }
 }

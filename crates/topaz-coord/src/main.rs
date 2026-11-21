@@ -109,7 +109,7 @@ async fn main() -> Result<()> {
                 let code = display_invite(&code);
                 match &args.public_url {
                     Some(url) => println!(
-                        "{code}\n  topaz init --coord-url {url} --pin {} && topaz account create --invite {code}",
+                        "{code}\n  topaz account create --coord-url {url} --pin {} --invite {code}",
                         server_tls.pin
                     ),
                     None => println!("{code}"),
@@ -156,13 +156,16 @@ async fn main() -> Result<()> {
     if args.stun_disable {
         info!("stun disabled");
     } else {
-        let stun_addr = args.stun_listen;
-        tokio::spawn(async move {
-            if let Err(e) = crate::stun::listen(stun_addr).await {
-                warn!(error = %e, %stun_addr, "stun listen failed");
+        match crate::stun::bind(args.stun_listen).await {
+            Ok(sock) => {
+                let bound_port = sock.local_addr().map(|a| a.port()).unwrap_or(args.stun_listen.port());
+                tokio::spawn(crate::stun::serve(sock));
+                state.set_stun(args.stun_advertise.clone(), bound_port);
             }
-        });
-        state.set_stun(args.stun_advertise.clone(), args.stun_listen.port());
+            Err(e) => {
+                warn!(error = %e, addr = %args.stun_listen, "stun bind failed; stun disabled");
+            }
+        }
     }
 
     let extra_listener = match args.relay_ws_listen {

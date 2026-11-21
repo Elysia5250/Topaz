@@ -3,6 +3,7 @@ use anyhow::{bail, Result};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, Extension};
 use axum::response::Response;
+use futures::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -155,11 +156,19 @@ struct Pending {
     stream: RelayConn,
 }
 
+struct ActiveSession {
+    dev_a: String,
+    dev_b: String,
+    cancel: tokio::sync::oneshot::Sender<()>,
+}
+
 struct Relay {
     state: Arc<AppState>,
     limits: Limits,
     pending: Mutex<HashMap<String, Pending>>,
     accounts: std::sync::Mutex<HashMap<String, Arc<AccountRelay>>>,
+    active: std::sync::Mutex<HashMap<u64, ActiveSession>>,
+    next_session_id: AtomicU64,
 }
 
 impl Relay {
@@ -213,6 +222,8 @@ impl RelayHandle {
             limits,
             pending: Mutex::new(HashMap::new()),
             accounts: std::sync::Mutex::new(HashMap::new()),
+            active: std::sync::Mutex::new(HashMap::new()),
+            next_session_id: AtomicU64::new(1),
         });
         {
             let relay = relay.clone();
@@ -228,6 +239,28 @@ impl RelayHandle {
 
     pub fn flush_usage(&self) {
         self.0.flush_usage();
+    }
+
+    /// Drop any pending or active relay sessions involving a revoked device.
+    pub async fn kick_device(&self, device_id: &str) {
+        {
+            let mut pending = self.0.pending.lock().await;
+            pending.retain(|_, p| p.device_id != device_id);
+        }
+        let cancels: Vec<tokio::sync::oneshot::Sender<()>> = {
+            let mut active = self.0.active.lock().unwrap();
+            let ids: Vec<u64> = active
+                .iter()
+                .filter(|(_, s)| s.dev_a == device_id || s.dev_b == device_id)
+                .map(|(&id, _)| id)
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| active.remove(&id).map(|s| s.cancel))
+                .collect()
+        };
+        for tx in cancels {
+            let _ = tx.send(());
+        }
     }
 
     pub async fn listen_tcp(&self, addr: SocketAddr) -> Result<()> {
@@ -289,15 +322,18 @@ fn session_key(a: &str, b: &str) -> String {
 }
 
 async fn read_hello(stream: &mut RelayConn) -> Result<RelayHello> {
-    let mut len_buf = [0u8; 4];
-    tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut len_buf)).await??;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_FRAME_BYTES.min(4096) {
-        bail!("relay hello too large");
-    }
-    let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf).await?;
-    Ok(postcard::from_bytes(&buf)?)
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len > MAX_FRAME_BYTES.min(4096) {
+            bail!("relay hello too large");
+        }
+        let mut buf = vec![0u8; len];
+        stream.read_exact(&mut buf).await?;
+        Ok(postcard::from_bytes(&buf)?)
+    })
+    .await?
 }
 
 /// Both ends must be active devices of the same account. Returns the account.
@@ -376,48 +412,96 @@ fn park_pending(map: &mut HashMap<String, Pending>, key: String, pending: Pendin
     map.insert(key, pending);
 }
 
-fn bridge_axum_ws(mut ws: WebSocket) -> RelayConn {
-    let (local, mut remote) = tokio::io::duplex(64 * 1024);
+const WS_PING_EVERY: Duration = Duration::from_secs(30);
+const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
+fn bridge_axum_ws(ws: WebSocket) -> RelayConn {
+    let (mut sink, mut stream) = ws.split();
+    let (local, remote) = tokio::io::duplex(64 * 1024);
+    let (mut remote_r, mut remote_w) = tokio::io::split(remote);
     let dead = Arc::new(AtomicBool::new(false));
     let flag = dead.clone();
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; WS_FRAME];
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(32);
+
+    // Writer task exclusively owns the WS sink, preventing duplex deadlocks.
+    let writer = tokio::spawn(async move {
+        let mut ping = tokio::time::interval(WS_PING_EVERY);
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ping.tick().await;
         loop {
             tokio::select! {
-                incoming = ws.recv() => {
-                    match incoming {
-                        Some(Ok(Message::Binary(b))) => {
-                            if remote.write_all(&b).await.is_err() {
-                                break;
-                            }
-                        }
-                        Some(Ok(Message::Ping(p))) => {
-                            if ws.send(Message::Pong(p)).await.is_err() {
-                                break;
-                            }
-                        }
-                        Some(Ok(Message::Pong(_))) | Some(Ok(Message::Text(_))) => {}
-                        Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                msg = rx.recv() => {
+                    let Some(msg) = msg else { break; };
+                    if sink.send(msg).await.is_err() {
+                        break;
                     }
                 }
-                outgoing = remote.read(&mut buf) => {
-                    match outgoing {
-                        Ok(0) | Err(_) => {
-                            let _ = ws.send(Message::Close(None)).await;
-                            break;
-                        }
-                        Ok(n) => {
-                            if ws.send(Message::Binary(buf[..n].to_vec().into())).await.is_err() {
-                                break;
-                            }
-                        }
+                _ = ping.tick() => {
+                    if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
+                        break;
                     }
                 }
             }
         }
-        flag.store(true, Ordering::Relaxed);
-        let _ = remote.shutdown().await;
+        let _ = sink.send(Message::Close(None)).await;
     });
+
+    // Outbound pump: duplex -> WS channel.
+    let tx_out = tx.clone();
+    let outbound = tokio::spawn(async move {
+        let mut buf = vec![0u8; WS_FRAME];
+        loop {
+            match remote_r.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx_out
+                        .send(Message::Binary(buf[..n].to_vec().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    // Inbound pump: WS stream -> duplex (with idle timeout).
+    let tx_in = tx.clone();
+    let inbound = tokio::spawn(async move {
+        loop {
+            let next = match tokio::time::timeout(WS_IDLE_TIMEOUT, stream.next()).await {
+                Ok(item) => item,
+                Err(_) => break,
+            };
+            match next {
+                Some(Ok(Message::Binary(b))) => {
+                    if remote_w.write_all(&b).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => {
+                    let _ = tx_in.try_send(Message::Pong(p));
+                }
+                Some(Ok(Message::Pong(_))) | Some(Ok(Message::Text(_))) => {}
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+            }
+        }
+        let _ = remote_w.shutdown().await;
+    });
+
+    drop(tx);
+    tokio::spawn(async move {
+        let mut outbound = outbound;
+        let mut inbound = inbound;
+        tokio::select! {
+            _ = &mut outbound => { inbound.abort(); }
+            _ = &mut inbound => { outbound.abort(); }
+        }
+        flag.store(true, Ordering::Relaxed);
+        let _ = writer.await;
+    });
+
     RelayConn::Ws(WsConn {
         stream: local,
         dead,
@@ -491,19 +575,45 @@ async fn handle_conn(mut stream: RelayConn, peer_addr: SocketAddr, relay: Arc<Re
     }
 
     info!(session = %key, account = %user_id, "relay session established");
+    let sid = relay.next_session_id.fetch_add(1, Ordering::Relaxed);
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    relay.active.lock().unwrap().insert(
+        sid,
+        ActiveSession {
+            dev_a: mine.device_id.clone(),
+            dev_b: other.device_id.clone(),
+            cancel: cancel_tx,
+        },
+    );
+    let relay_for_task = relay.clone();
     tokio::spawn(async move {
-        match (mine.stream, other.stream) {
-            (RelayConn::Tcp(a), RelayConn::Tcp(b)) => {
-                let (ar, aw) = a.into_split();
-                let (br, bw) = b.into_split();
-                let _ = tokio::join!(pump_tcp(ar, bw, acct.clone()), pump_tcp(br, aw, acct.clone()));
+        let pump = async {
+            match (mine.stream, other.stream) {
+                (RelayConn::Tcp(a), RelayConn::Tcp(b)) => {
+                    let (ar, aw) = a.into_split();
+                    let (br, bw) = b.into_split();
+                    tokio::select! {
+                        _ = pump_tcp(ar, bw, acct.clone()) => {}
+                        _ = pump_tcp(br, aw, acct.clone()) => {}
+                    }
+                }
+                (a, b) => {
+                    let (ar, aw) = tokio::io::split(a);
+                    let (br, bw) = tokio::io::split(b);
+                    tokio::select! {
+                        _ = pump_any(ar, bw, acct.clone()) => {}
+                        _ = pump_any(br, aw, acct.clone()) => {}
+                    }
+                }
             }
-            (a, b) => {
-                let (ar, aw) = tokio::io::split(a);
-                let (br, bw) = tokio::io::split(b);
-                let _ = tokio::join!(pump_any(ar, bw, acct.clone()), pump_any(br, aw, acct.clone()));
+        };
+        tokio::select! {
+            _ = pump => {}
+            _ = cancel_rx => {
+                info!(session = %key, "relay session terminated due to device revocation");
             }
         }
+        relay_for_task.active.lock().unwrap().remove(&sid);
         acct.sessions.fetch_sub(1, Ordering::AcqRel);
     });
     Ok(())

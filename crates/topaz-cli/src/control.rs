@@ -33,6 +33,7 @@ pub struct ControlState {
     pub control_lock: tokio::sync::Mutex<()>,
     pub pending_adds: PendingAdds,
     pub started: Instant,
+    pub shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 impl ControlState {
@@ -61,15 +62,7 @@ pub async fn bind_socket(path: &FilePath) -> Result<tokio::net::UnixListener> {
 fn configure_socket_permissions(path: &FilePath) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660));
-    if let (Ok(uid_s), Ok(gid_s)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID")) {
-        if let (Ok(uid), Ok(gid)) = (uid_s.parse::<libc::uid_t>(), gid_s.parse::<libc::gid_t>()) {
-            if let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
-                unsafe {
-                    libc::chown(c_path.as_ptr(), uid, gid);
-                }
-            }
-        }
-    }
+    topaz_core::chown_to_sudo_user(path);
 }
 
 #[cfg(not(unix))]
@@ -92,6 +85,7 @@ fn router(state: Arc<ControlState>) -> Router {
         .route("/v1/services/{id}/open/{target}", get(ws_service_open))
         .route("/v1/services/{id}/accept", get(ws_service_accept))
         .route("/v1/kick", post(post_kick))
+        .route("/v1/shutdown", post(post_shutdown))
         .route("/v1/devices", get(list_devices))
         .route("/v1/devices/add", post(start_device_add))
         .route("/v1/devices/add/{code}", get(poll_device_add))
@@ -141,6 +135,11 @@ async fn post_kick(
     let announce = q.announce.unwrap_or(true);
     st.engine.kick(announce);
     Json(json!({ "kicked": true, "announce": announce }))
+}
+
+async fn post_shutdown(State(st): State<Arc<ControlState>>) -> Json<serde_json::Value> {
+    let _ = st.shutdown.send(true);
+    Json(json!({ "shutting_down": true }))
 }
 
 async fn list_devices(
@@ -382,6 +381,7 @@ mod tests {
             control_lock: tokio::sync::Mutex::new(()),
             pending_adds: Mutex::new(HashMap::new()),
             started: Instant::now(),
+            shutdown: tokio::sync::watch::channel(false).0,
         })
     }
 
@@ -840,6 +840,7 @@ mod tests {
                 control_lock: tokio::sync::Mutex::new(()),
                 pending_adds: Mutex::new(HashMap::new()),
                 started: Instant::now(),
+                shutdown: tokio::sync::watch::channel(false).0,
             });
             let ctrl_srv = ctrl.clone();
             tokio::spawn(async move {

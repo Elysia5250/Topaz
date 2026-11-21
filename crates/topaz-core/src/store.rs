@@ -3,6 +3,9 @@ use crate::identity::DeviceIdentity;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static TMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
@@ -27,7 +30,10 @@ pub struct Store {
 impl Store {
     pub fn open(root: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&root)?;
-        std::fs::create_dir_all(root.join("tmp"))?;
+        let tmp_dir = root.join("tmp");
+        std::fs::create_dir_all(&tmp_dir)?;
+        chown_to_sudo_user(&root);
+        chown_to_sudo_user(&tmp_dir);
         let identity = DeviceIdentity::load_or_create(&root.join("device.json"))?;
         let config_path = root.join("config.json");
         let config = if config_path.exists() {
@@ -50,9 +56,16 @@ impl Store {
     }
 
     fn atomic_write(&self, name: &str, data: String) -> Result<()> {
-        let tmp = self.root.join("tmp").join(format!("{name}.tmp"));
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = self
+            .root
+            .join("tmp")
+            .join(format!("{name}.{}.{seq}.tmp", std::process::id()));
         std::fs::write(&tmp, data)?;
-        std::fs::rename(&tmp, self.root.join(name)).with_context(|| format!("write {name}"))?;
+        chown_to_sudo_user(&tmp);
+        let dst = self.root.join(name);
+        std::fs::rename(&tmp, &dst).with_context(|| format!("write {name}"))?;
+        chown_to_sudo_user(&dst);
         Ok(())
     }
 
@@ -110,10 +123,51 @@ impl Store {
 }
 
 fn dirs_next_home() -> Option<PathBuf> {
+    #[cfg(unix)]
+    if let Some(sudo_home) = sudo_user_home() {
+        return Some(sudo_home);
+    }
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
 }
+
+#[cfg(unix)]
+fn sudo_user_home() -> Option<PathBuf> {
+    let user = std::env::var("SUDO_USER").ok()?;
+    let user = user.trim();
+    if user.is_empty() || user == "root" {
+        return None;
+    }
+    let c_user = std::ffi::CString::new(user).ok()?;
+    unsafe {
+        let pw = libc::getpwnam(c_user.as_ptr());
+        if pw.is_null() || (*pw).pw_dir.is_null() {
+            return None;
+        }
+        let dir = std::ffi::CStr::from_ptr((*pw).pw_dir);
+        use std::os::unix::ffi::OsStrExt;
+        Some(PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes())))
+    }
+}
+
+/// If running under `sudo`, transfer ownership of `path` back to the invoking
+/// user (`SUDO_UID`/`SUDO_GID`) so non-root CLI/TUI commands stay usable.
+#[cfg(unix)]
+pub fn chown_to_sudo_user(path: &Path) {
+    if let (Ok(uid_s), Ok(gid_s)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID")) {
+        if let (Ok(uid), Ok(gid)) = (uid_s.parse::<libc::uid_t>(), gid_s.parse::<libc::gid_t>()) {
+            if let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
+                unsafe {
+                    libc::chown(c_path.as_ptr(), uid, gid);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn chown_to_sudo_user(_path: &Path) {}
 
 pub fn ensure_parent(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {

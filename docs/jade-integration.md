@@ -257,12 +257,11 @@ jade --on laptop                 topaz (local)              topaz (laptop)      
    - 新增 `WsByteStream`（`AsyncRead + AsyncWrite` 封装 WebSocket Binary 帧）。
    - 新增 `TopazClient`（连接 `TOPAZ_CONTROL_SOCK` / `~/.topaz/control.sock`）：
      - `devices()` / `status()` / `subscribe_events()`（解析本机 `services` 及远端 `peers[].services`，`#[serde(default)]` 兼容缺省空数组）
-     - `TopazDialer`（实现 `AgentDialer`）：默认走 `GET /v1/services/16/open/{peer}`；可选支持 L3 模式（通过 `devices()` 解析 `virtual_ip` 直连 `<ip>:<port>`）。
+     - `TopazDialer`（实现 `AgentDialer`）：统一走 `GET /v1/services/16/open/{peer}`（不走 L3 直连）。
    - 修改 `jade_service::dialer_for`：除 `local` 外使用 `TopazDialer`（或在迁移期保留 `JADE_BRIDGE_SOCK` 兼容 `RouteDialer`）。
 2. **在 `jade-cli` 的 `jade serve` 接入入站桥接与角色开关**：
    - 后台常驻任务连接 `control.sock` 的 `GET /v1/services/16/accept?name=jade`，维持 2~4 条等待连接，断线指数退避重连（`topaz` 未启动时静默等待重试，不影响本地 `jade.sock` 正常使用）。
    - 收到 `"event": "accepted"` 文本帧后，读取 `peer_device_id` 并 `tokio::spawn(server.serve_stream(&peer_device_id, ws_byte_stream))`。
-   - 若同时启用 L3 TCP 监听（可选 `--listen-vpn <port>`），对接入连接按 `remote_ip -> device_id` 反查后再调用 `AgentServer::serve_stream(&device_id, tcp_stream)`。
    - 按需提供 `--worker-only`（仅注册 `service 16` 被控接单）与 `--local-only`（不向外暴露 `service 16`，仅本地使用）选项。
 3. **测试与清理**：
    - 在 `jade-service` 中使用本地 `tokio::net::UnixListener` + `axum`/`tokio-tungstenite` 编写 Mock `control.sock` 集成测试，覆盖：`/v1/services/16/open/{peer}` 正常与 `404/409/503` 错误传播、`/v1/services/16/accept` 身份交接与 `allowlist` 拦截、`peers[].services` 发现解析、流关闭取消 `JobLog` 推送等场景。

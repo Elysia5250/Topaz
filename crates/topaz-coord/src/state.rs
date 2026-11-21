@@ -113,10 +113,7 @@ impl AppState {
         if let Some(adv) = advertise {
             return adv.clone();
         }
-        let host = host_header
-            .and_then(|h| h.rsplit_once(':').map(|(h, _)| h).or(Some(h)))
-            .filter(|h| !h.is_empty())
-            .unwrap_or("127.0.0.1");
+        let host = host_without_port(host_header);
         format!("{host}:{port}")
     }
 
@@ -142,11 +139,14 @@ impl AppState {
     /// Accept a signed message's time and nonce at most once.
     pub fn fresh(&self, time: u64, nonce: &str) -> bool {
         let now = now_unix();
-        if time.abs_diff(now) > MAX_SKEW_SECS || nonce.len() < 16 {
+        if time.abs_diff(now) > MAX_SKEW_SECS || nonce.len() < 16 || nonce.len() > 128 {
             return false;
         }
         let mut nonces = self.nonces.lock().unwrap();
         nonces.retain(|_, t| now.saturating_sub(*t) <= 2 * MAX_SKEW_SECS);
+        if nonces.len() >= 65_536 {
+            return false;
+        }
         nonces.insert(nonce.to_string(), time).is_none()
     }
 
@@ -158,10 +158,7 @@ impl AppState {
                 format!("tcp://{adv}")
             };
         }
-        let host = host_header
-            .and_then(|h| h.rsplit_once(':').map(|(h, _)| h).or(Some(h)))
-            .filter(|h| !h.is_empty())
-            .unwrap_or("127.0.0.1");
+        let host = host_without_port(host_header);
         format!("tcp://{host}:{}", self.relay_port)
     }
 
@@ -177,10 +174,7 @@ impl AppState {
             };
             return format!("wss://{adv}{path}");
         }
-        let host = host_header
-            .and_then(|h| h.rsplit_once(':').map(|(h, _)| h).or(Some(h)))
-            .filter(|h| !h.is_empty())
-            .unwrap_or("127.0.0.1");
+        let host = host_without_port(host_header);
         let port = self
             .relay_ws_port
             .lock()
@@ -212,6 +206,24 @@ impl AppState {
             .lock()
             .unwrap()
             .retain(|_, m| m.created.elapsed() < MAILBOX_TTL);
+    }
+}
+
+/// Strip an optional `:port` suffix from an HTTP `Host` header while preserving
+/// bracketed IPv6 literals such as `[2001:db8::1]` or `[2001:db8::1]:7722`.
+fn host_without_port(host_header: Option<&str>) -> &str {
+    let Some(h) = host_header.map(str::trim).filter(|s| !s.is_empty()) else {
+        return "127.0.0.1";
+    };
+    if let Some(rest) = h.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return &h[..=end + 1];
+        }
+        return h;
+    }
+    match h.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() && !host.contains(':') && port.chars().all(|c| c.is_ascii_digit()) => host,
+        _ => h,
     }
 }
 
@@ -265,6 +277,15 @@ mod tests {
             st.advertise_relay_ws(Some("10.0.0.1:7722")),
             "wss://vps.example:443/v1/relay"
         );
+    }
+
+    #[test]
+    fn host_without_port_preserves_ipv6_literals() {
+        assert_eq!(host_without_port(Some("[2001:db8::1]")), "[2001:db8::1]");
+        assert_eq!(host_without_port(Some("[2001:db8::1]:7722")), "[2001:db8::1]");
+        assert_eq!(host_without_port(Some("vps.example:7722")), "vps.example");
+        assert_eq!(host_without_port(Some("vps.example")), "vps.example");
+        assert_eq!(host_without_port(None), "127.0.0.1");
     }
 }
 

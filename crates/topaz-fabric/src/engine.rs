@@ -90,6 +90,7 @@ pub(crate) struct Engine {
     pub(crate) sessions: Vec<SessionEntry>,
     pub(crate) pending_opens: HashMap<String, Vec<PendingOpen>>,
     pub(crate) dial_in_flight: HashSet<String>,
+    pub(crate) relay_in_flight: HashSet<String>,
     pub(crate) dial_backoff: HashMap<String, Instant>,
     pub(crate) probing: HashSet<String>,
     pub(crate) punching: Arc<Mutex<HashSet<String>>>,
@@ -209,7 +210,11 @@ impl Engine {
                     }
                 }
                 Some(res) = dial_done_rx.recv() => {
-                    self.dial_in_flight.remove(&res.peer_id);
+                    if res.is_relay_accept {
+                        self.relay_in_flight.remove(&res.peer_id);
+                    } else {
+                        self.dial_in_flight.remove(&res.peer_id);
+                    }
                     match res.link {
                         Ok(link) => {
                             let peer = PeerInfo {

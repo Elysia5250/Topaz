@@ -50,6 +50,7 @@ pub(crate) struct PendingOpen {
 /// Outcome reported back to the engine loop from a background dial task.
 pub(crate) struct DialResult {
     pub(crate) peer_id: String,
+    pub(crate) is_relay_accept: bool,
     pub(crate) link: std::result::Result<PeerLink, String>,
 }
 
@@ -143,7 +144,6 @@ impl Engine {
             drop(link);
             return None;
         }
-        let new_direct = link.kind == ConnectionKind::Direct;
         let new_client = link.quic_client.clone();
         let dispatch = self.stream_dispatch(&peer);
         let dgram_cb = self.datagram_dispatch(&peer.device_id);
@@ -161,18 +161,11 @@ impl Engine {
             if s.peer.device_id != peer.device_id {
                 return s.mux.is_alive();
             }
-            let superseded = new_direct
-                && (s.peer.kind != ConnectionKind::Direct
-                    || match (&new_client, &s.client_id) {
-                        (Some(nc), Some(sc)) => nc <= sc,
-                        _ => false,
-                    });
-            if superseded {
-                s.mux.close();
-                false
-            } else {
-                s.mux.is_alive()
-            }
+            // `should_keep(&link)` already decided this new link wins the peer's
+            // single session slot (including relay replacing an older relay), so
+            // always close and retire the previous entry for this peer.
+            s.mux.close();
+            false
         });
         self.push_session(peer.clone(), mux.clone(), datagram, new_client);
         self.peer_discovery_seq.remove(&peer.device_id);
@@ -330,6 +323,7 @@ impl Engine {
                 debug!(peer = %peer_id, "dial skipped: peer has no candidates");
                 let _ = dial_done_tx.send(DialResult {
                     peer_id,
+                    is_relay_accept: false,
                     link: Err("no endpoints".into()),
                 });
                 return;
@@ -350,6 +344,7 @@ impl Engine {
             .map_err(|e| e.to_string());
             let _ = dial_done_tx.send(DialResult {
                 peer_id,
+                is_relay_accept: false,
                 link: res,
             });
         });
@@ -357,7 +352,7 @@ impl Engine {
 
     /// Spawn a background relay accept when a peer asks us to meet at the relay.
     pub(crate) fn spawn_relay_accept(&mut self, peer: &str) {
-        if !self.dial_in_flight.insert(peer.to_string()) {
+        if !self.relay_in_flight.insert(peer.to_string()) {
             return;
         }
         let identity = self.identity.clone();
@@ -373,6 +368,7 @@ impl Engine {
                 .map_err(|e| e.to_string());
             let _ = dial_done_tx.send(DialResult {
                 peer_id,
+                is_relay_accept: true,
                 link: res,
             });
         });

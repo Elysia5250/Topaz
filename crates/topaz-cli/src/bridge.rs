@@ -631,16 +631,19 @@ pub async fn ws_service_accept(
             Err(e) => return json_error(StatusCode::BAD_REQUEST, "invalid_service", e.to_string()),
         };
 
-    ws.on_upgrade(move |mut socket| async move {
-        let mut guard = WaiterGuard {
-            service_id,
-            waiter_id,
-            services: Arc::clone(&st.services),
-            engine: st.engine.clone(),
-            status: Arc::clone(&st.status),
-            armed: true,
-        };
+    // Construct the guard *before* `ws.on_upgrade` so if the HTTP upgrade is
+    // abandoned before the callback runs, dropping the closure still removes
+    // the waiter from `ServiceRegistry`.
+    let mut guard = WaiterGuard {
+        service_id,
+        waiter_id,
+        services: Arc::clone(&st.services),
+        engine: st.engine.clone(),
+        status: Arc::clone(&st.status),
+        armed: true,
+    };
 
+    ws.on_upgrade(move |mut socket| async move {
         let accepted = loop {
             tokio::select! {
                 res = &mut rx => {
@@ -660,6 +663,7 @@ pub async fn ws_service_accept(
                 }
             }
         };
+        drop(guard);
 
         let Some((peer, channel)) = accepted else {
             return;

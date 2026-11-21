@@ -30,7 +30,7 @@ struct Cli {
     data_dir: Option<PathBuf>,
 
     #[command(subcommand)]
-    cmd: Commands,
+    cmd: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -68,11 +68,19 @@ enum Commands {
         name: Option<String>,
         #[arg(long)]
         install: bool,
+        /// Start the daemon in the background right after joining.
+        #[arg(long)]
+        start: bool,
+        /// Used with `--start`: run without TUN (control.sock + sessions only).
+        #[arg(long)]
+        no_tun: bool,
     },
     /// Print account, connection and peer session status.
     Status,
     /// Print the local control socket path clients should dial.
     SocketPath,
+    /// Stop the running background daemon cleanly.
+    Stop,
     /// Nudge the running daemon to probe/announce peers.
     Kick {
         #[arg(long)]
@@ -85,11 +93,11 @@ enum Commands {
         #[command(subcommand)]
         cmd: ServiceCmd,
     },
-    /// OpenCode-style live terminal UI connected to the running daemon over control.sock.
+    /// Live terminal UI connected to the running daemon over control.sock.
     Tui {
-        /// Color theme ("opencode" or "light").
-        #[arg(long, default_value = "opencode")]
-        theme: String,
+        /// Color theme override ("ink", "tokyonight", or "light").
+        #[arg(long)]
+        theme: Option<String>,
     },
     /// Run the network engine node (long-lived).
     Run {
@@ -133,6 +141,15 @@ enum AccountCmd {
     Create {
         #[arg(long)]
         invite: String,
+        /// Optional coord URL (merges `topaz init` into a single step).
+        #[arg(long, env = "COORD_URL")]
+        coord_url: Option<String>,
+        /// Optional coord TLS pin (used with `--coord-url`).
+        #[arg(long, env = "COORD_PIN")]
+        pin: Option<String>,
+        /// Optional friendly device name.
+        #[arg(long)]
+        name: Option<String>,
     },
 }
 
@@ -152,13 +169,15 @@ async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let cli = Cli::parse();
+    let is_run = matches!(&cli.cmd, Some(Commands::Run { .. }));
+    let is_tui = matches!(&cli.cmd, Some(Commands::Tui { .. }) | None);
     #[cfg(unix)]
-    if !matches!(&cli.cmd, Commands::Run { .. }) {
+    if !is_run {
         unsafe {
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
         }
     }
-    if !matches!(&cli.cmd, Commands::Tui { .. }) {
+    if !is_tui {
         let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             tracing_subscriber::EnvFilter::new(
                 "topaz_cli=info,topaz_net=info,topaz_fabric=info,topaz_vpn=info",
@@ -172,15 +191,32 @@ async fn main() -> Result<()> {
 
     let data_dir = cli.data_dir.unwrap_or_else(Store::default_data_dir);
 
-    match cli.cmd {
+    let Some(cmd) = cli.cmd else {
+        if client::ControlClient::try_daemon(&data_dir).await.is_some() {
+            return tui::cmd_tui(data_dir, None).await;
+        }
+        println!("topaz daemon is not running for {}", data_dir.display());
+        println!("  start (no TUN):  topaz run --no-tun --detach");
+        println!("  start (VPN TUN): sudo topaz run --detach");
+        println!("  all commands:    topaz --help");
+        return Ok(());
+    };
+
+    match cmd {
         Commands::Init {
             coord_url,
             pin,
             name,
         } => cmd_init(data_dir, coord_url, pin, name),
         Commands::Account {
-            cmd: AccountCmd::Create { invite },
-        } => cmd_account_create(data_dir, invite).await,
+            cmd:
+                AccountCmd::Create {
+                    invite,
+                    coord_url,
+                    pin,
+                    name,
+                },
+        } => cmd_account_create(data_dir, invite, coord_url, pin, name).await,
         Commands::Device { cmd } => match cmd {
             DeviceCmd::Add => cmd_device_add(data_dir).await,
             DeviceCmd::List => cmd_device_list(data_dir).await,
@@ -194,7 +230,9 @@ async fn main() -> Result<()> {
             bundle,
             name,
             install,
-        } => cmd_setup(data_dir, bundle, name, install).await,
+            start,
+            no_tun,
+        } => cmd_setup(data_dir, bundle, name, install, start, no_tun).await,
         Commands::Status => cmd_status(data_dir).await,
         Commands::SocketPath => {
             println!(
@@ -203,10 +241,11 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
+        Commands::Stop => cmd_stop(data_dir).await,
         Commands::Kick { local } => cmd_kick(data_dir, !local).await,
         Commands::Doctor => doctor::cmd_doctor(data_dir).await,
         Commands::Service { cmd } => service::cmd_service(data_dir, cmd).await,
-        Commands::Tui { theme } => tui::cmd_tui(data_dir, &theme).await,
+        Commands::Tui { theme } => tui::cmd_tui(data_dir, theme.as_deref()).await,
         Commands::Run {
             coord_url,
             force_relay,
@@ -276,9 +315,37 @@ fn cmd_init(
     Ok(())
 }
 
-async fn cmd_account_create(data_dir: PathBuf, invite: String) -> Result<()> {
+async fn cmd_account_create(
+    data_dir: PathBuf,
+    invite: String,
+    coord_url: Option<String>,
+    pin: Option<String>,
+    name: Option<String>,
+) -> Result<()> {
     let mut store = Store::open(data_dir)?;
     ensure_no_account(&store)?;
+    let mut changed = false;
+    if let Some(u) = coord_url {
+        if !u.starts_with("https://") {
+            bail!("coord URL must start with https://");
+        }
+        store.config.coord_url = u;
+        changed = true;
+    }
+    if let Some(p) = pin {
+        let bytes = parse_pin(&p).ok_or_else(|| {
+            anyhow::anyhow!("invalid pin (expected 32 base32 chars from `topaz-coord fingerprint`)")
+        })?;
+        store.config.coord_pin = format_pin(&bytes);
+        changed = true;
+    }
+    if let Some(n) = name {
+        store.config.device_name = n;
+        changed = true;
+    }
+    if changed {
+        store.save_config()?;
+    }
     let coord = ops::coord_client(&store)?;
     let recovery = generate_recovery_code();
     let root = AccountKey::from_recovery(&recovery)?;
@@ -319,7 +386,12 @@ async fn cmd_device_add(data_dir: PathBuf) -> Result<()> {
         }
         println!("waiting up to 5 minutes...");
         let _ = std::io::stdout().flush();
-        let v = daemon.get(&format!("/v1/devices/add/{code}")).await?;
+        let v = daemon
+            .get_with_timeout(
+                &format!("/v1/devices/add/{code}"),
+                std::time::Duration::from_secs(330),
+            )
+            .await?;
         println!(
             "added {} ({})",
             v["name"].as_str().unwrap_or("?"),
@@ -386,6 +458,8 @@ async fn cmd_setup(
     bundle: String,
     name: Option<String>,
     install: bool,
+    start: bool,
+    no_tun: bool,
 ) -> Result<()> {
     let b = parse_setup_bundle(&bundle)?;
     if !b.url.starts_with("https://") {
@@ -414,12 +488,36 @@ async fn cmd_setup(
 
     if install {
         service::cmd_service(data_dir, ServiceCmd::Install { no_tun: true }).await?;
+    } else if start {
+        let vpn_cfg = topaz_vpn::VpnConfig {
+            disabled: no_tun,
+            tun_name: None,
+            mtu: topaz_vpn::DEFAULT_MTU,
+            dns_listen: None,
+        };
+        run::spawn_detached(data_dir, None, false, true, vpn_cfg).await?;
     } else {
         println!(
-            "start the node with `topaz run`, or `topaz service install` for autostart"
+            "start the node with `topaz run --detach`, or `topaz service install` for autostart"
         );
     }
     Ok(())
+}
+
+async fn cmd_stop(data_dir: PathBuf) -> Result<()> {
+    let Some(daemon) = client::ControlClient::try_daemon(&data_dir).await else {
+        println!("topaz daemon is not running");
+        return Ok(());
+    };
+    let _ = daemon.post("/v1/shutdown", None).await;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if client::ControlClient::try_daemon(&data_dir).await.is_none() {
+            println!("topaz daemon stopped");
+            return Ok(());
+        }
+    }
+    bail!("daemon did not exit within 5 seconds");
 }
 
 async fn cmd_join(data_dir: PathBuf, code: Option<String>, recovery: bool) -> Result<()> {

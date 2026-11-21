@@ -74,13 +74,14 @@ impl RouteTable {
 
     /// Decide where to forward a packet read from the TUN interface.
     pub fn route_outbound(&self, pkt: &[u8]) -> OutboundAction {
-        let Some((src, dst)) = parse_ipv4_endpoints(pkt) else {
+        let Some((src, dst, _total_len)) = parse_ipv4_endpoints(pkt) else {
             return OutboundAction::Drop;
         };
-        if let Some(me) = self.self_ip {
-            if src != me || dst == me {
-                return OutboundAction::Drop;
-            }
+        let Some(me) = self.self_ip else {
+            return OutboundAction::Drop;
+        };
+        if src != me || dst == me {
+            return OutboundAction::Drop;
         }
         if dst.is_multicast() || dst.is_broadcast() || dst.is_loopback() || dst.is_unspecified() {
             return OutboundAction::Drop;
@@ -95,28 +96,29 @@ impl RouteTable {
 
     /// Validate a packet received from `from_peer_id` before injecting into TUN.
     /// Enforces source-IP anti-spoofing (`src == peer's virtual_ip`) and
-    /// destination verification (`dst == self_ip`).
-    pub fn validate_inbound(&self, from_peer_id: &str, pkt: &Bytes) -> bool {
-        let Some((src, dst)) = parse_ipv4_endpoints(pkt) else {
-            return false;
-        };
-        let Some(&expected_src) = self.peer_to_ip.get(from_peer_id) else {
-            return false;
-        };
+    /// destination verification (`dst == self_ip`). Returns the validated IPv4
+    /// `total_len` so callers can trim any trailing bytes before writing to TUN.
+    pub fn validate_inbound_len(&self, from_peer_id: &str, pkt: &Bytes) -> Option<usize> {
+        let (src, dst, total_len) = parse_ipv4_endpoints(pkt)?;
+        let &expected_src = self.peer_to_ip.get(from_peer_id)?;
         if src != expected_src {
-            return false;
+            return None;
         }
-        if let Some(me) = self.self_ip {
-            if dst != me {
-                return false;
-            }
+        let me = self.self_ip?;
+        if dst != me {
+            return None;
         }
-        true
+        Some(total_len)
+    }
+
+    /// Boolean wrapper around [`Self::validate_inbound_len`].
+    pub fn validate_inbound(&self, from_peer_id: &str, pkt: &Bytes) -> bool {
+        self.validate_inbound_len(from_peer_id, pkt).is_some()
     }
 }
 
-/// Extract `(src, dst)` from a raw IPv4 packet. Rejects IPv6 and truncated packets.
-pub fn parse_ipv4_endpoints(pkt: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr)> {
+/// Extract `(src, dst, total_len)` from a raw IPv4 packet. Rejects IPv6 and truncated packets.
+pub fn parse_ipv4_endpoints(pkt: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr, usize)> {
     if pkt.len() < 20 {
         return None;
     }
@@ -134,7 +136,7 @@ pub fn parse_ipv4_endpoints(pkt: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr)> {
     }
     let src = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
     let dst = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
-    Some((src, dst))
+    Some((src, dst, total_len))
 }
 
 #[cfg(test)]

@@ -14,9 +14,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use topaz_proto::auth::{format_pin, pin_bytes};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 use tower_service::Service;
-use tracing::debug;
+use tracing::{debug, warn};
+
+const MAX_CONCURRENT_CONNS: usize = 1024;
 
 #[derive(Clone)]
 pub struct ServerTls {
@@ -56,11 +59,25 @@ impl ServerTls {
     /// `ConnectInfo<SocketAddr>` and allowing WebSocket upgrades.
     pub async fn serve(&self, listener: TcpListener, app: Router) -> Result<()> {
         let acceptor = TlsAcceptor::from(self.config.clone());
+        let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNS));
         loop {
-            let (tcp, addr) = listener.accept().await?;
+            let permit = match sem.clone().acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => return Ok(()),
+            };
+            let (tcp, addr) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    drop(permit);
+                    warn!(error = %e, "https accept failed; backing off");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+            };
             let acceptor = acceptor.clone();
             let app = app.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 let tls = match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(tcp)).await {
                     Ok(Ok(tls)) => tls,
                     Ok(Err(e)) => {
@@ -74,7 +91,11 @@ impl ServerTls {
                     let mut app = app.clone();
                     app.call(req)
                 });
-                if let Err(e) = Builder::new(TokioExecutor::new())
+                let mut builder = Builder::new(TokioExecutor::new());
+                builder
+                    .http1()
+                    .header_read_timeout(Duration::from_secs(15));
+                if let Err(e) = builder
                     .serve_connection_with_upgrades(TokioIo::new(tls), service)
                     .await
                 {

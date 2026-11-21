@@ -8,10 +8,15 @@ use std::net::SocketAddr;
 use topaz_proto::stun::{binding_response, parse_binding_request};
 use tracing::{info, warn};
 
-/// Serve BINDING requests on `addr` (IPv4) until the process exits.
-pub async fn listen(addr: SocketAddr) -> Result<()> {
+/// Bind a UDP socket for STUN BINDING requests.
+pub async fn bind(addr: SocketAddr) -> Result<tokio::net::UdpSocket> {
     let socket = tokio::net::UdpSocket::bind(addr).await?;
     info!(%addr, "stun listening");
+    Ok(socket)
+}
+
+/// Serve BINDING requests on a bound socket until the process exits.
+pub async fn serve(socket: tokio::net::UdpSocket) {
     let mut buf = vec![0u8; 1500];
     loop {
         match socket.recv_from(&mut buf).await {

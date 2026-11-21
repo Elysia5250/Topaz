@@ -60,13 +60,15 @@ pub fn binding_response(txn: &[u8; 12], mapped: std::net::SocketAddr) -> Vec<u8>
         .map(|(i, b)| b ^ cookie_byte(txn, i))
         .collect();
 
-    let mut msg = Vec::with_capacity(HEADER_LEN + 4 + xaddr.len());
+    let attr_value_len = 4 + xaddr.len();
+    let msg_len = 4 + attr_value_len; // 4-byte attribute header + value
+    let mut msg = Vec::with_capacity(HEADER_LEN + msg_len);
     msg.extend_from_slice(&BINDING_RESPONSE.to_be_bytes());
-    msg.extend_from_slice(&((4 + xaddr.len()) as u16).to_be_bytes());
+    msg.extend_from_slice(&(msg_len as u16).to_be_bytes());
     msg.extend_from_slice(&MAGIC.to_be_bytes());
     msg.extend_from_slice(txn);
     msg.extend_from_slice(&ATTR_XOR_MAPPED.to_be_bytes());
-    msg.extend_from_slice(&((4 + xaddr.len()) as u16).to_be_bytes());
+    msg.extend_from_slice(&(attr_value_len as u16).to_be_bytes());
     msg.push(0);
     msg.push(family);
     msg.extend_from_slice(&xport.to_be_bytes());
@@ -154,6 +156,8 @@ mod tests {
     fn response_roundtrip_v4() {
         let mapped = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 32853);
         let msg = binding_response(&TXN, mapped);
+        assert_eq!(u16::from_be_bytes([msg[2], msg[3]]) as usize, msg.len() - HEADER_LEN);
+        assert_eq!(u16::from_be_bytes([msg[2], msg[3]]), 12);
         assert_eq!(parse_binding_response(&msg, &TXN), Some(mapped));
         let other_txn = [0u8; 12];
         assert_eq!(parse_binding_response(&msg, &other_txn), None);
@@ -163,6 +167,8 @@ mod tests {
     fn response_roundtrip_v6() {
         let mapped = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)), 9999);
         let msg = binding_response(&TXN, mapped);
+        assert_eq!(u16::from_be_bytes([msg[2], msg[3]]) as usize, msg.len() - HEADER_LEN);
+        assert_eq!(u16::from_be_bytes([msg[2], msg[3]]), 24);
         assert_eq!(parse_binding_response(&msg, &TXN), Some(mapped));
     }
 

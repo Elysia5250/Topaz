@@ -179,7 +179,11 @@ async fn add_device(State(state): Shared, body: Bytes) -> ApiResult<StatusCode> 
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn revoke(State(state): Shared, body: Bytes) -> ApiResult<StatusCode> {
+async fn revoke(
+    State(state): Shared,
+    axum::Extension(relay): axum::Extension<crate::relay::RelayHandle>,
+    body: Bytes,
+) -> ApiResult<StatusCode> {
     let rev: Revocation = parse(&body)?;
     let (user_pubkey, entries, set) = state
         .account(&rev.user_id)
@@ -202,6 +206,7 @@ async fn revoke(State(state): Shared, body: Bytes) -> ApiResult<StatusCode> {
     }
     state.db.set_revocation(&rev).map_err(internal)?;
     state.drop_device(&rev.device_id);
+    relay.kick_device(&rev.device_id).await;
     info!(user = %rev.user_id, device = %rev.device_id, "device revoked");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -277,14 +282,35 @@ async fn enroll_start(
     let start: EnrollStart = parse(&body)?;
     state.purge_mailboxes();
     let mut boxes = state.mailboxes.lock().unwrap();
+    if boxes.len() >= 1024 {
+        return Err(err(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many active pairing sessions on server; try again later",
+        ));
+    }
+    let owner_count = boxes.values().filter(|m| m.owner == me.device_id).count();
+    if owner_count >= 3 {
+        return Err(err(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many pending pairing codes for this device",
+        ));
+    }
     let mut rng = rand::rngs::OsRng;
-    let nameplate = loop {
+    let mut nameplate = None;
+    for _ in 0..64 {
         let np: String = (0..3)
             .map(|_| NAMEPLATE_ALPHABET[rng.gen_range(0..NAMEPLATE_ALPHABET.len())] as char)
             .collect();
         if !boxes.contains_key(&np) {
-            break np;
+            nameplate = Some(np);
+            break;
         }
+    }
+    let Some(nameplate) = nameplate else {
+        return Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "pairing code space exhausted; try again later",
+        ));
     };
     boxes.insert(
         nameplate.clone(),

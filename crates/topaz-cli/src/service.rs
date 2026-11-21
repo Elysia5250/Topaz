@@ -44,13 +44,22 @@ pub fn launchd_plist_path() -> Result<std::path::PathBuf> {
         .join(format!("{LAUNCHD_LABEL}.plist")))
 }
 
+fn systemd_quote(p: &Path) -> String {
+    let s = p.display().to_string();
+    if s.contains([' ', '\t', '"', '\\']) {
+        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        s
+    }
+}
+
 pub fn systemd_unit(exe: &Path, data_dir: &Path, no_tun: bool) -> String {
     format!(
         "[Unit]\nDescription=Topaz node\nAfter=network-online.target\n\n\
          [Service]\nExecStart={} --data-dir {} run{}\nRestart=on-failure\nRestartSec=5\n\n\
          [Install]\nWantedBy=default.target\n",
-        exe.display(),
-        data_dir.display(),
+        systemd_quote(exe),
+        systemd_quote(data_dir),
         if no_tun { " --no-tun" } else { "" }
     )
 }
@@ -161,7 +170,13 @@ pub fn uninstall() -> Result<String> {
 pub fn status_line() -> String {
     if cfg!(target_os = "macos") {
         let installed = launchd_plist_path().map(|p| p.exists()).unwrap_or(false);
-        format!("launchd installed={installed}")
+        let active = std::process::Command::new("launchctl")
+            .args(["list", LAUNCHD_LABEL])
+            .output()
+            .ok()
+            .map(|o| if o.status.success() { "loaded" } else { "unloaded" })
+            .unwrap_or("unknown");
+        format!("launchd installed={installed} active={active}")
     } else {
         let installed = systemd_unit_path().map(|p| p.exists()).unwrap_or(false);
         let active = std::process::Command::new("systemctl")

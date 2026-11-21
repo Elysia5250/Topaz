@@ -20,14 +20,20 @@ pub async fn cmd_doctor(data_dir: PathBuf) -> Result<()> {
     println!("coord_pin {}", store.config.coord_pin);
 
     // Daemon section: is this data-dir's node running, and how long?
+    let mut live_status: Option<serde_json::Value> = None;
     match crate::client::ControlClient::try_daemon(&store.root).await {
-        Some(c) => match c.get("/healthz").await {
-            Ok(v) => println!(
-                "daemon live  uptime={}s",
-                v["uptime_s"].as_u64().unwrap_or(0)
-            ),
-            Err(e) => println!("daemon ({e})"),
-        },
+        Some(c) => {
+            match c.get("/healthz").await {
+                Ok(v) => println!(
+                    "daemon live  uptime={}s",
+                    v["uptime_s"].as_u64().unwrap_or(0)
+                ),
+                Err(e) => println!("daemon ({e})"),
+            }
+            if let Ok(st) = c.get("/v1/status").await {
+                live_status = Some(st);
+            }
+        }
         None => println!("daemon (not running)"),
     }
 
@@ -107,21 +113,33 @@ pub async fn cmd_doctor(data_dir: PathBuf) -> Result<()> {
                         println!("peers");
                         for e in others {
                             println!("  {}  {}", e.cert.device_id, e.cert.name);
+                            if let Some(st) = &live_status {
+                                if let Some(p) = st["peers"]
+                                    .as_array()
+                                    .and_then(|arr| {
+                                        arr.iter().find(|p| {
+                                            p["device_id"].as_str() == Some(e.cert.device_id.as_str())
+                                        })
+                                    })
+                                {
+                                    let path = p["path"].as_str().unwrap_or("offline");
+                                    let rtt = p["rtt_ms"]
+                                        .as_u64()
+                                        .map(|ms| format!("{ms}ms"))
+                                        .unwrap_or_else(|| "-".into());
+                                    println!("    session {path}  rtt={rtt}");
+                                }
+                            }
                             match coord.peer_endpoints(&e.cert.device_id).await {
                                 Ok(Some(eps)) => {
                                     if eps.endpoints.is_empty() {
-                                        println!("    endpoints (none)");
+                                        println!("    udp_endpoints (none)");
                                     } else {
-                                        println!("    endpoints {}", eps.endpoints.join(" "));
-                                        for ep in &eps.endpoints {
-                                            let probe =
-                                                probe_tcp(ep, Duration::from_secs(2)).await;
-                                            println!("    probe {ep}  {probe}");
-                                        }
+                                        println!("    udp_endpoints {}", eps.endpoints.join(" "));
                                     }
                                 }
-                                Ok(None) => println!("    endpoints (offline)"),
-                                Err(err) => println!("    endpoints ({err})"),
+                                Ok(None) => println!("    udp_endpoints (offline)"),
+                                Err(err) => println!("    udp_endpoints ({err})"),
                             }
                             match lan.get(&e.cert.device_id) {
                                 Some(addr) => println!("    lan {addr}"),
@@ -157,13 +175,18 @@ fn guessed_relay(coord_url: &str) -> Option<String> {
     if hostport.is_empty() {
         return None;
     }
-    if let Some((host, port)) = hostport.rsplit_once(':') {
-        if port.parse::<u16>().ok()? == 7722 {
-            return Some(format!("{host}:7723"));
-        }
-        return Some(hostport.to_string());
-    }
-    Some(format!("{hostport}:7723"))
+    let host = if let Some(inner) = hostport.strip_prefix('[') {
+        inner
+            .find(']')
+            .map(|end| &hostport[..=end + 1])
+            .unwrap_or(hostport)
+    } else {
+        hostport
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(hostport)
+    };
+    Some(format!("{host}:7723"))
 }
 
 fn guessed_stun(coord_url: &str) -> Option<String> {
