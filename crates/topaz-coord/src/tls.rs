@@ -6,7 +6,7 @@ use axum::extract::ConnectInfo;
 use axum::Router;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::SigningKey;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder;
 use rcgen::{CertificateParams, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -94,6 +94,7 @@ impl ServerTls {
                 let mut builder = Builder::new(TokioExecutor::new());
                 builder
                     .http1()
+                    .timer(TokioTimer::new())
                     .header_read_timeout(Duration::from_secs(15));
                 if let Err(e) = builder
                     .serve_connection_with_upgrades(TokioIo::new(tls), service)
@@ -103,5 +104,88 @@ impl ServerTls {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::routing::get;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn serves_http1_over_tls_with_header_read_timeout() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tls = ServerTls::from_seed([42u8; 32]).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/healthz", get(|| async { "ok" }));
+        let server_tls = tls.clone();
+        tokio::spawn(async move {
+            let _ = server_tls.serve(listener, app).await;
+        });
+
+        // Connect with a permissive test TLS verifier and send a raw HTTP/1.1 request.
+        #[derive(Debug)]
+        struct NoVerify;
+        impl rustls::client::danger::ServerCertVerifier for NoVerify {
+            fn verify_server_cert(
+                &self,
+                _: &CertificateDer<'_>,
+                _: &[CertificateDer<'_>],
+                _: &rustls::pki_types::ServerName<'_>,
+                _: &[u8],
+                _: rustls::pki_types::UnixTime,
+            ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            }
+            fn verify_tls12_signature(
+                &self,
+                _: &[u8],
+                _: &CertificateDer<'_>,
+                _: &rustls::DigitallySignedStruct,
+            ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+            }
+            fn verify_tls13_signature(
+                &self,
+                _: &[u8],
+                _: &CertificateDer<'_>,
+                _: &rustls::DigitallySignedStruct,
+            ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+            }
+            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+                vec![rustls::SignatureScheme::ED25519]
+            }
+        }
+
+        let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerify))
+        .with_no_client_auth();
+        cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
+        let mut stream = connector
+            .connect(
+                rustls::pki_types::ServerName::try_from("topaz-coord").unwrap(),
+                tcp,
+            )
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "unexpected response: {resp}");
+        assert!(resp.ends_with("\r\n\r\nok"), "unexpected body: {resp}");
     }
 }
