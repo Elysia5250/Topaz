@@ -430,168 +430,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "conduit-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64 0.22.1",
- "bytes",
- "clap",
- "conduit-core",
- "conduit-fabric",
- "conduit-net",
- "conduit-proto",
- "conduit-vpn",
- "ed25519-dalek",
- "futures",
- "hex",
- "http-body-util",
- "hyper",
- "hyper-util",
- "libc",
- "rand 0.8.8",
- "ratatui",
- "rcgen",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "tokio-rustls",
- "tokio-tungstenite 0.26.2",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "conduit-coord"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "conduit-proto",
- "ed25519-dalek",
- "futures",
- "hex",
- "hyper",
- "hyper-util",
- "postcard",
- "rand 0.8.8",
- "rcgen",
- "rusqlite",
- "rustls",
- "serde",
- "serde_json",
- "socket2",
- "tokio",
- "tokio-rustls",
- "tower",
- "tower-http",
- "tower-service",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "conduit-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "conduit-proto",
- "data-encoding",
- "ed25519-dalek",
- "hex",
- "rand 0.8.8",
- "rcgen",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "conduit-fabric"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "conduit-core",
- "conduit-net",
- "conduit-proto",
- "ed25519-dalek",
- "futures",
- "hex",
- "http-body-util",
- "hyper",
- "hyper-util",
- "mdns-sd",
- "rand 0.8.8",
- "rcgen",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "tokio-rustls",
- "tracing",
-]
-
-[[package]]
-name = "conduit-net"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "bytes",
- "chacha20poly1305",
- "conduit-core",
- "conduit-proto",
- "ed25519-dalek",
- "futures",
- "hex",
- "if-addrs 0.13.4",
- "postcard",
- "quinn",
- "rand 0.8.8",
- "reqwest",
- "rustls",
- "serde",
- "serde_json",
- "socket2",
- "spake2",
- "tokio",
- "tokio-rustls",
- "tokio-tungstenite 0.26.2",
- "tracing",
-]
-
-[[package]]
-name = "conduit-proto"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "data-encoding",
- "ed25519-dalek",
- "hex",
- "postcard",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "conduit-vpn"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "conduit-fabric",
- "conduit-proto",
- "serde",
- "tokio",
- "tracing",
- "tun-rs",
-]
-
-[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2961,6 +2799,168 @@ dependencies = [
  "libc",
  "pin-project-lite",
  "tokio",
+]
+
+[[package]]
+name = "topaz-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "clap",
+ "ed25519-dalek",
+ "futures",
+ "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "rand 0.8.8",
+ "ratatui",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite 0.26.2",
+ "topaz-core",
+ "topaz-fabric",
+ "topaz-net",
+ "topaz-proto",
+ "topaz-vpn",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "topaz-coord"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "ed25519-dalek",
+ "futures",
+ "hex",
+ "hyper",
+ "hyper-util",
+ "postcard",
+ "rand 0.8.8",
+ "rcgen",
+ "rusqlite",
+ "rustls",
+ "serde",
+ "serde_json",
+ "socket2",
+ "tokio",
+ "tokio-rustls",
+ "topaz-proto",
+ "tower",
+ "tower-http",
+ "tower-service",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "topaz-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "data-encoding",
+ "ed25519-dalek",
+ "hex",
+ "rand 0.8.8",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "topaz-proto",
+]
+
+[[package]]
+name = "topaz-fabric"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "ed25519-dalek",
+ "futures",
+ "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "mdns-sd",
+ "rand 0.8.8",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "topaz-core",
+ "topaz-net",
+ "topaz-proto",
+ "tracing",
+]
+
+[[package]]
+name = "topaz-net"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "bytes",
+ "chacha20poly1305",
+ "ed25519-dalek",
+ "futures",
+ "hex",
+ "if-addrs 0.13.4",
+ "postcard",
+ "quinn",
+ "rand 0.8.8",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "socket2",
+ "spake2",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite 0.26.2",
+ "topaz-core",
+ "topaz-proto",
+ "tracing",
+]
+
+[[package]]
+name = "topaz-proto"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "data-encoding",
+ "ed25519-dalek",
+ "hex",
+ "postcard",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "topaz-vpn"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "serde",
+ "tokio",
+ "topaz-fabric",
+ "topaz-proto",
+ "tracing",
+ "tun-rs",
 ]
 
 [[package]]

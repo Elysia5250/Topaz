@@ -1,13 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/conduit-proto",
-    "crates/conduit-core",
-    "crates/conduit-net",
-    "crates/conduit-fabric",
-    "crates/conduit-vpn",
-    "crates/conduit-coord",
-    "crates/conduit-cli",
+    "crates/topaz-proto",
+    "crates/topaz-core",
+    "crates/topaz-net",
+    "crates/topaz-fabric",
+    "crates/topaz-vpn",
+    "crates/topaz-coord",
+    "crates/topaz-cli",
 ]
 
 [workspace.package]
