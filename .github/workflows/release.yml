@@ -1,0 +1,124 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v0.1.0)"
+        required: true
+        default: "v0.1.0"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset_suffix }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            asset_suffix: linux-x86_64
+            musl: true
+            build_coord: true
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset_suffix: linux-aarch64
+            musl: true
+            build_coord: true
+          - os: macos-14
+            target: aarch64-apple-darwin
+            asset_suffix: macos-aarch64
+            musl: false
+            build_coord: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl-tools (Linux)
+        if: matrix.musl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build topaz-coord (static musl)
+        if: matrix.build_coord
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} -p topaz-coord
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/topaz-coord dist/topaz-coord-${{ matrix.asset_suffix }}
+          strip dist/topaz-coord-${{ matrix.asset_suffix }} || true
+
+      - name: Build topaz CLI
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} -p topaz-cli
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/topaz dist/topaz-${{ matrix.asset_suffix }}
+          strip dist/topaz-${{ matrix.asset_suffix }} || true
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.asset_suffix }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        working-directory: artifacts
+        run: |
+          sha256sum topaz* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "name=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          generate_release_notes: true
+          files: |
+            artifacts/topaz*
+            artifacts/SHA256SUMS.txt

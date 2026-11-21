@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
 # Topaz Coord (topaz-coord) one-command Linux VPS installer / upgrader.
 #
-# Usage (on your Linux VPS as root / sudo):
-#   sudo ./deploy-coord.sh --binary ./topaz-coord --public-url https://1.2.3.4:7722
+# Zero-build usage (downloads prebuilt static musl binary from GitHub Releases):
+#   curl -fsSL https://raw.githubusercontent.com/Elysia5250/Topaz/master/scripts/deploy-coord.sh \
+#     | sudo bash -s -- --public-url https://<VPS_IP>:7722
 #
-# Re-running this script upgrades the binary in place without overwriting
-# /etc/topaz-coord/coord.env or /var/lib/topaz-coord/coord.db.
+# Local binary usage:
+#   sudo ./deploy-coord.sh --binary ./topaz-coord --public-url https://<VPS_IP>:7722
+#
+# Re-running this script upgrades /usr/local/bin/topaz-coord in place without
+# overwriting /etc/topaz-coord/coord.env or /var/lib/topaz-coord/coord.db.
 
 set -euo pipefail
 
+REPO="Elysia5250/Topaz"
+VERSION="latest"
 BIN_SRC=""
 PUBLIC_URL=""
 LISTEN_PORT="7722"
@@ -17,13 +23,23 @@ STUN_PORT="3478"
 ENABLE_WS_443="false"
 RELAY_MBPS="50"
 RELAY_SESSIONS="8"
+TMP_DIR=""
+
+cleanup() {
+    if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
+        rm -rf "$TMP_DIR"
+    fi
+}
+trap cleanup EXIT
 
 usage() {
     cat <<'EOF'
 Usage: sudo ./deploy-coord.sh [OPTIONS]
 
 Options:
-  --binary <PATH>        Path to compiled `topaz-coord` binary (default: ./topaz-coord)
+  --binary <PATH>        Use a local `topaz-coord` binary instead of downloading from GitHub Releases
+  --version <TAG>        Release tag to download (default: latest, e.g. v0.1.0)
+  --repo <OWNER/REPO>    GitHub repository for releases (default: Elysia5250/Topaz)
   --public-url <URL>     Public coord URL printed with invite codes (e.g. https://1.2.3.4:7722)
   --port <PORT>          HTTPS/WSS control-plane port (default: 7722)
   --relay-port <PORT>    TCP relay port (default: 7723)
@@ -38,6 +54,8 @@ EOF
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --binary) BIN_SRC="$2"; shift 2 ;;
+        --version) VERSION="$2"; shift 2 ;;
+        --repo) REPO="$2"; shift 2 ;;
         --public-url) PUBLIC_URL="$2"; shift 2 ;;
         --port) LISTEN_PORT="$2"; shift 2 ;;
         --relay-port) RELAY_PORT="$2"; shift 2 ;;
@@ -55,14 +73,54 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+download_release_binary() {
+    local arch asset base_url
+    case "$(uname -m)" in
+        x86_64|amd64) arch="x86_64" ;;
+        aarch64|arm64) arch="aarch64" ;;
+        other)
+            echo "Unsupported CPU architecture: $(uname -m). Build from source and pass --binary." >&2
+            exit 1
+            ;;
+        *)
+            echo "Unsupported CPU architecture: $(uname -m). Build from source and pass --binary." >&2
+            exit 1
+            ;;
+    esac
+
+    asset="topaz-coord-linux-${arch}"
+    if [[ "$VERSION" == "latest" ]]; then
+        base_url="https://github.com/${REPO}/releases/latest/download"
+    else
+        base_url="https://github.com/${REPO}/releases/download/${VERSION}"
+    fi
+
+    TMP_DIR="$(mktemp -d)"
+    echo "Downloading ${asset} (${VERSION}) from ${REPO}..."
+    curl -fsSL "${base_url}/${asset}" -o "${TMP_DIR}/${asset}"
+    curl -fsSL "${base_url}/SHA256SUMS.txt" -o "${TMP_DIR}/SHA256SUMS.txt"
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        echo "Verifying SHA256 checksum..."
+        (
+            cd "$TMP_DIR"
+            grep "  ${asset}\$" SHA256SUMS.txt | sha256sum -c -
+        )
+    else
+        echo "Warning: sha256sum not found; skipping checksum verification." >&2
+    fi
+
+    chmod 0755 "${TMP_DIR}/${asset}"
+    BIN_SRC="${TMP_DIR}/${asset}"
+}
+
 if [[ -z "$BIN_SRC" ]]; then
     if [[ -x "./topaz-coord" ]]; then
         BIN_SRC="./topaz-coord"
     elif [[ -x "./target/release/topaz-coord" ]]; then
         BIN_SRC="./target/release/topaz-coord"
     else
-        echo "Could not find topaz-coord binary. Pass --binary /path/to/topaz-coord" >&2
-        exit 1
+        download_release_binary
     fi
 fi
 
@@ -163,7 +221,7 @@ echo ""
 echo "=== topaz-coord is running ==="
 systemctl --no-pager --lines=5 status topaz-coord.service || true
 echo ""
-PIN="$(sudo -u topaz env $(grep -v '^#' "$ENV_FILE" | xargs) /usr/local/bin/topaz-coord fingerprint 2>/dev/null || true)"
+PIN="$(sudo -u topaz bash -c 'set -a; source /etc/topaz-coord/coord.env; /usr/local/bin/topaz-coord fingerprint' 2>/dev/null || true)"
 echo "TLS Pin: ${PIN:-<run: sudo -u topaz topaz-coord --db /var/lib/topaz-coord/coord.db fingerprint>}"
 echo ""
 echo "Open these firewall ports on your VPS:"

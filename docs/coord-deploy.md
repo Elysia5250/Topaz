@@ -2,35 +2,33 @@
 
 `topaz-coord` 是单二进制、零外部依赖（内置 SQLite、自签名 Ed25519 TLS 1.3、STUN 与 TCP/WSS Relay）的协调服务器，无需域名或反向代理即可在任意 Linux VPS 上线。
 
-## 1. 构建二进制
+## 1. 零构建一键安装（推荐，适用于 256MB+ 廉价 VPS）
 
-在你的开发机（或直接在 VPS 上）编译 release 二进制：
+GitHub Actions（`.github/workflows/release.yml`）已为每次 `v*` 发版自动构建全静态链接（`musl`）的 `topaz-coord-linux-x86_64` 与 `topaz-coord-linux-aarch64` 二进制并附带 `SHA256SUMS.txt`。在 VPS 上直接执行一行命令即可安装或升级，无需安装 Rust：
+
+```bash
+PUBLIC_IP="$(curl -4 -fsS https://ifconfig.me)"
+curl -fsSL https://raw.githubusercontent.com/Elysia5250/Topaz/master/scripts/deploy-coord.sh \
+  | sudo bash -s -- --public-url "https://${PUBLIC_IP}:7722"
+```
+
+> 可选参数：
+> - `--version v0.1.0`：指定发布版本（默认 `latest`）
+> - `--ws-443`：若 443 端口空闲，额外在 443 端口监听 WSS 中继（适用于仅放行 443 的严格防火墙环境）
+
+再次运行同一条命令即可**无损升级二进制**，不会覆盖 `/etc/topaz-coord/coord.env` 与 `/var/lib/topaz-coord/coord.db`。
+
+## 2. 备选：本地编译后上传安装
+
+如需部署尚未发版的开发分支，可在开发机编译并上传：
 
 ```bash
 cargo build --release -p topaz-coord
-# 产物位置: target/release/topaz-coord
-```
-
-如果本地是 x86_64 Linux 且 VPS 也是同架构 Linux，直接上传 `target/release/topaz-coord` 与 `scripts/deploy-coord.sh` 即可：
-
-```bash
 scp target/release/topaz-coord scripts/deploy-coord.sh root@<VPS_IP>:/tmp/
-```
-
-## 2. 一键安装 / 升级
-
-登录 VPS 执行：
-
-```bash
+# 登录 VPS 执行：
 chmod +x /tmp/deploy-coord.sh
-sudo /tmp/deploy-coord.sh \
-  --binary /tmp/topaz-coord \
-  --public-url https://<VPS_IP>:7722
+sudo /tmp/deploy-coord.sh --binary /tmp/topaz-coord --public-url https://<VPS_IP>:7722
 ```
-
-> 可选：如果客户端处于严格防火墙环境（只放行 443 端口），且 VPS 的 443 端口未被占用，可加 `--ws-443` 参数同时在 443 端口提供 WSS 中继。
-
-再次运行同一条命令即可**无损升级二进制**，不会覆盖 `/etc/topaz-coord/coord.env` 与 `/var/lib/topaz-coord/coord.db`。
 
 ## 3. 防火墙放行端口
 
@@ -60,4 +58,15 @@ sudo journalctl -u topaz-coord -f
 
 # 5. 备份数据库（含服务端 TLS 密钥与账号设备表）
 sudo cp /var/lib/topaz-coord/coord.db /root/coord.db.bak
+```
+
+---
+
+## 5. 发布新版本（维护者）
+
+推送新 tag 即自动触发 `.github/workflows/release.yml` 构建全静态 Linux `x86_64` / `aarch64` 与 macOS `aarch64` 二进制并发布到 GitHub Releases：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
 ```
