@@ -190,11 +190,15 @@ impl CoordClient {
     }
 
     pub async fn enroll_start(&self, msg_a: String) -> Result<String> {
+        self.enroll_start_room(msg_a, None).await
+    }
+
+    pub async fn enroll_start_room(&self, msg_a: String, room: Option<String>) -> Result<String> {
         let started: EnrollStarted = self
             .json(
                 Method::POST,
                 "/v1/enroll",
-                Some(&EnrollStart { msg_a }),
+                Some(&EnrollStart { msg_a, room }),
                 true,
             )
             .await?
@@ -202,17 +206,22 @@ impl CoordClient {
         Ok(started.nameplate)
     }
 
-    pub async fn enroll_offer(&self, nameplate: &str) -> Result<String> {
-        let start: EnrollStart = self
+    pub async fn enroll_offer_opt(&self, nameplate: &str) -> Result<Option<String>> {
+        let start: Option<EnrollStart> = self
             .json(
                 Method::GET,
                 &format!("/v1/enroll/{nameplate}"),
                 None::<&()>,
                 false,
             )
+            .await?;
+        Ok(start.map(|s| s.msg_a))
+    }
+
+    pub async fn enroll_offer(&self, nameplate: &str) -> Result<String> {
+        self.enroll_offer_opt(nameplate)
             .await?
-            .ok_or_else(|| anyhow!("code not found or expired"))?;
-        Ok(start.msg_a)
+            .ok_or_else(|| anyhow!("code not found or expired"))
     }
 
     pub async fn enroll_reply(&self, nameplate: &str, reply: &EnrollReply) -> Result<()> {

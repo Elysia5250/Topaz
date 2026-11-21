@@ -162,6 +162,110 @@ pub async fn join_with_code(
     Ok(cert)
 }
 
+/// Normalize a user-chosen pairing phrase (case-insensitive, trimmed).
+pub fn normalize_secret(secret: &str) -> Result<String> {
+    let cleaned = secret.trim().to_ascii_lowercase();
+    if cleaned.len() < 4 {
+        bail!("pairing phrase must be at least 4 characters");
+    }
+    Ok(cleaned)
+}
+
+/// Derive an opaque 24-hex-char room key from a user-chosen pairing phrase so
+/// the coord never sees the plaintext secret.
+pub fn pair_room_key(normalized_secret: &str) -> String {
+    let digest = blake3::derive_key("topaz pair room v1", normalized_secret.as_bytes());
+    hex::encode(&digest[..12])
+}
+
+/// Approve a new device using a user-chosen pairing phrase (both sides enter
+/// the same phrase; the coord only sees a derived room key and SPAKE2 traffic).
+/// `confirm` is called with `(device_name, device_id)` before signing the cert.
+pub async fn approve_with_secret(
+    coord: &CoordClient,
+    identity: &DeviceIdentity,
+    account: &AccountInfo,
+    secret: &str,
+    confirm: impl FnOnce(&str, &str) -> Result<bool>,
+) -> Result<DeviceCert> {
+    let pw = normalize_secret(secret)?;
+    let room = pair_room_key(&pw);
+    let (state, msg_a) = Spake2::<Ed25519Group>::start_a(
+        &Password::new(pw.as_bytes()),
+        &Identity::new(ID_A),
+        &Identity::new(ID_B),
+    );
+    let nameplate = coord.enroll_start_room(hex::encode(msg_a), Some(room)).await?;
+
+    let reply = poll(|| coord.enroll_get_reply(&nameplate)).await?;
+    let shared = state
+        .finish(&hex::decode(&reply.msg_b)?)
+        .map_err(|_| anyhow!("key exchange failed"))?;
+    let req: JoinRequest = serde_json::from_slice(&open(&shared, NONCE_NEW, &reply.payload)?)
+        .context("malformed join request")?;
+
+    let new_device_id = topaz_proto::auth::derive_id_hex(&req.device_pubkey)
+        .ok_or_else(|| anyhow!("new device sent malformed public key"))?;
+    if !confirm(&req.name, &new_device_id)? {
+        bail!("pairing rejected by user");
+    }
+
+    let cert = issue_cert(
+        &identity.signing,
+        &account.user_id,
+        &account.user_pubkey,
+        &req.device_pubkey,
+        &req.name,
+    )?;
+    coord.add_device(&cert).await?;
+    coord
+        .enroll_finish(
+            &nameplate,
+            seal(&shared, NONCE_EXISTING, &serde_json::to_vec(&cert)?)?,
+        )
+        .await?;
+    Ok(cert)
+}
+
+/// Join an existing account using a user-chosen pairing phrase. Polls until
+/// the existing device publishes the matching room (order-independent).
+pub async fn join_with_secret(
+    coord: &CoordClient,
+    identity: &DeviceIdentity,
+    name: &str,
+    secret: &str,
+) -> Result<DeviceCert> {
+    let pw = normalize_secret(secret)?;
+    let room = pair_room_key(&pw);
+    let msg_a = poll(|| coord.enroll_offer_opt(&room)).await?;
+    let (state, msg_b) = Spake2::<Ed25519Group>::start_b(
+        &Password::new(pw.as_bytes()),
+        &Identity::new(ID_A),
+        &Identity::new(ID_B),
+    );
+    let shared = state
+        .finish(&hex::decode(&msg_a)?)
+        .map_err(|_| anyhow!("key exchange failed"))?;
+    let request = JoinRequest {
+        device_pubkey: identity.pubkey_hex.clone(),
+        name: name.to_string(),
+    };
+    coord
+        .enroll_reply(
+            &room,
+            &EnrollReply {
+                msg_b: hex::encode(msg_b),
+                payload: seal(&shared, NONCE_NEW, &serde_json::to_vec(&request)?)?,
+            },
+        )
+        .await?;
+
+    let payload = poll(|| coord.enroll_get_finish(&room)).await?;
+    let cert: DeviceCert = serde_json::from_slice(&open(&shared, NONCE_EXISTING, &payload)?)
+        .context("malformed certificate")?;
+    Ok(cert)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

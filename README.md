@@ -85,11 +85,14 @@ topaz account create --coord-url https://<VPS_IP>:7722 --pin <PIN> --invite <COD
 # 2. Start daemon (with L3 TUN, or add --no-tun for user-level control.sock mode):
 sudo topaz run --detach   # or: topaz run --no-tun --detach
 
-# 3. Open live TUI (auto-opens when daemon is running):
-topaz                     # press `a` to pair a new device, `c` to copy setup command
+# 3. Pair a second device (e.g. MacBook) with a short phrase (zero copy-paste):
+# On the existing device (Linux):
+topaz pair my-secret-01
+# On the new device (MacBook — auto-probes TLS pin for one-time [Y/n] trust):
+topaz pair <VPS_IP> my-secret-01 --name macbook
 
-# 4. Join a second device (e.g. MacBook) in one command:
-topaz setup 'topaz-setup:v1:...' --name macbook --start
+# 4. Open live TUI (auto-opens when daemon is running):
+topaz
 
 # 5. Stop daemon cleanly:
 topaz stop

@@ -12,7 +12,9 @@ use clap::{Parser, Subcommand};
 use topaz_core::{
     generate_recovery_code, issue_cert, issue_revocation, AccountInfo, AccountKey, Store,
 };
-use topaz_net::{approve_new_device, join_with_code};
+use topaz_net::{
+    approve_new_device, approve_with_secret, join_with_code, join_with_secret, probe_coord_pin,
+};
 use topaz_proto::auth::{format_pin, parse_pin};
 use topaz_proto::CreateAccountRequest;
 use serde_json::json;
@@ -60,6 +62,29 @@ enum Commands {
         code: Option<String>,
         #[arg(long, conflicts_with = "code")]
         recovery: bool,
+    },
+    /// Pair devices using a short human-chosen phrase (zero copy-paste).
+    ///
+    /// Existing device: `topaz pair <phrase>`
+    /// New device:      `topaz pair <coord-ip-or-url> <phrase> [--name macbook]`
+    Pair {
+        /// Either `<phrase>` (existing device or already-initialized new device),
+        /// or `<coord-host-or-url>` when followed by `<phrase>`.
+        first: String,
+        /// Pairing phrase when `<first>` is the coord host/URL.
+        second: Option<String>,
+        /// Optional friendly device name (new device).
+        #[arg(long)]
+        name: Option<String>,
+        /// Auto-confirm TOFU server pin / new device approval without prompting.
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Start the daemon in the background right after joining (new device).
+        #[arg(long)]
+        start: bool,
+        /// Used with `--start`: run without TUN (control.sock + sessions only).
+        #[arg(long)]
+        no_tun: bool,
     },
     /// One-line onboarding on a new device from a `device add` bundle.
     Setup {
@@ -226,6 +251,14 @@ async fn main() -> Result<()> {
             } => cmd_device_revoke(data_dir, device_id, recovery).await,
         },
         Commands::Join { code, recovery } => cmd_join(data_dir, code, recovery).await,
+        Commands::Pair {
+            first,
+            second,
+            name,
+            yes,
+            start,
+            no_tun,
+        } => cmd_pair(data_dir, first, second, name, yes, start, no_tun).await,
         Commands::Setup {
             bundle,
             name,
@@ -549,6 +582,141 @@ async fn cmd_join(data_dir: PathBuf, code: Option<String>, recovery: bool) -> Re
         info.user_id, store.identity.device_id
     );
     store.save_account(info)?;
+    Ok(())
+}
+
+fn normalize_coord_arg(raw: &str) -> String {
+    let s = raw.trim().trim_end_matches('/');
+    if s.starts_with("https://") || s.starts_with("http://") {
+        return s.to_string();
+    }
+    if s.starts_with('[') {
+        if s.contains("]:") {
+            format!("https://{s}")
+        } else {
+            format!("https://{s}:7722")
+        }
+    } else if s.contains(':') {
+        format!("https://{s}")
+    } else {
+        format!("https://{s}:7722")
+    }
+}
+
+fn confirm_prompt(prompt: &str) -> Result<bool> {
+    eprint!("{prompt} [Y/n] ");
+    std::io::stderr().flush()?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    let ans = line.trim().to_ascii_lowercase();
+    Ok(ans.is_empty() || ans == "y" || ans == "yes")
+}
+
+async fn cmd_pair(
+    data_dir: PathBuf,
+    first: String,
+    second: Option<String>,
+    name: Option<String>,
+    yes: bool,
+    start: bool,
+    no_tun: bool,
+) -> Result<()> {
+    let mut store = Store::open(data_dir.clone())?;
+
+    // Existing device with an account -> approve mode (`topaz pair <phrase>`).
+    if let Some(account) = store.account.clone() {
+        if second.is_some() {
+            bail!(
+                "this device already belongs to account {}; run `topaz pair <phrase>` to approve a new device",
+                account.user_id
+            );
+        }
+        let phrase = first;
+        let coord = ops::coord_client(&store)?;
+        let coord_display = store.config.coord_url.clone();
+        println!("waiting for peer with phrase '{phrase}' on {coord_display} (up to 5 min)...");
+        println!(
+            "on the new device run:\n  topaz pair {} {phrase}",
+            coord_display
+                .strip_prefix("https://")
+                .unwrap_or(&coord_display)
+                .strip_suffix(":7722")
+                .unwrap_or(coord_display.strip_prefix("https://").unwrap_or(&coord_display))
+        );
+        let _ = std::io::stdout().flush();
+
+        let cert = approve_with_secret(&coord, &store.identity, &account, &phrase, |dev_name, dev_id| {
+            if yes {
+                return Ok(true);
+            }
+            confirm_prompt(&format!("Approve '{dev_name}' ({dev_id}) to join this account?"))
+        })
+        .await?;
+        println!("added {} ({})", cert.name, cert.device_id);
+        return Ok(());
+    }
+
+    // New device without an account -> join mode.
+    let (coord_arg, phrase) = match second {
+        Some(p) => (Some(first), p),
+        None => (None, first),
+    };
+
+    if let Some(raw_coord) = coord_arg {
+        let url = normalize_coord_arg(&raw_coord);
+        if !url.starts_with("https://") {
+            bail!("coord URL must start with https:// (got {url})");
+        }
+        let need_probe = store.config.coord_url != url || store.config.coord_pin.is_empty();
+        if need_probe {
+            println!("probing coord TLS fingerprint at {url}...");
+            let pin = probe_coord_pin(&url).await?;
+            let short = &pin[..9.min(pin.len())];
+            if !yes
+                && !confirm_prompt(&format!(
+                    "Trust coord {url}\n  pin: {pin} (starts with {short})?"
+                ))?
+            {
+                bail!("aborted by user");
+            }
+            store.config.coord_url = url;
+            store.config.coord_pin = pin;
+            store.save_config()?;
+        }
+    }
+
+    if let Some(n) = &name {
+        store.config.device_name = n.clone();
+        store.save_config()?;
+    }
+
+    let coord = ops::coord_client(&store)?;
+    let my_name = store.device_name();
+    println!(
+        "waiting to pair as '{my_name}' with phrase '{phrase}' on {} (up to 5 min)...",
+        store.config.coord_url
+    );
+    let _ = std::io::stdout().flush();
+
+    let cert = join_with_secret(&coord, &store.identity, &my_name, &phrase).await?;
+    let info = AccountInfo::from_cert(&store.identity, cert)?;
+    println!(
+        "joined account {} as {} ({})",
+        info.user_id, store.identity.device_id, my_name
+    );
+    store.save_account(info)?;
+
+    if start {
+        let vpn_cfg = topaz_vpn::VpnConfig {
+            disabled: no_tun,
+            tun_name: None,
+            mtu: topaz_vpn::DEFAULT_MTU,
+            dns_listen: None,
+        };
+        run::spawn_detached(data_dir, None, false, true, vpn_cfg).await?;
+    } else {
+        println!("start the node with `sudo topaz run --detach` (or `topaz run --no-tun --detach`)");
+    }
     Ok(())
 }
 

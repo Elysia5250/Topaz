@@ -295,22 +295,43 @@ async fn enroll_start(
             "too many pending pairing codes for this device",
         ));
     }
-    let mut rng = rand::rngs::OsRng;
-    let mut nameplate = None;
-    for _ in 0..64 {
-        let np: String = (0..3)
-            .map(|_| NAMEPLATE_ALPHABET[rng.gen_range(0..NAMEPLATE_ALPHABET.len())] as char)
-            .collect();
-        if !boxes.contains_key(&np) {
-            nameplate = Some(np);
-            break;
+    let nameplate = if let Some(room) = start.room {
+        let room = room.trim().to_string();
+        if room.len() < 6
+            || room.len() > 64
+            || !room.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "invalid pairing room key",
+            ));
         }
-    }
-    let Some(nameplate) = nameplate else {
-        return Err(err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "pairing code space exhausted; try again later",
-        ));
+        if boxes.contains_key(&room) {
+            return Err(err(
+                StatusCode::CONFLICT,
+                "pairing code is already in use; choose another phrase",
+            ));
+        }
+        room
+    } else {
+        let mut rng = rand::rngs::OsRng;
+        let mut np_opt = None;
+        for _ in 0..64 {
+            let np: String = (0..3)
+                .map(|_| NAMEPLATE_ALPHABET[rng.gen_range(0..NAMEPLATE_ALPHABET.len())] as char)
+                .collect();
+            if !boxes.contains_key(&np) {
+                np_opt = Some(np);
+                break;
+            }
+        }
+        let Some(np) = np_opt else {
+            return Err(err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "pairing code space exhausted; try again later",
+            ));
+        };
+        np
     };
     boxes.insert(
         nameplate.clone(),
@@ -339,6 +360,7 @@ async fn enroll_offer(
     let mb = boxes.get(&nameplate).ok_or_else(not_found)?;
     Ok(Json(EnrollStart {
         msg_a: mb.msg_a.clone(),
+        room: None,
     }))
 }
 

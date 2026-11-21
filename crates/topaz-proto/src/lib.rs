@@ -48,6 +48,10 @@ pub struct PeerEndpoints {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnrollStart {
     pub msg_a: String,
+    /// Optional client-derived room key for user-chosen pairing phrases.
+    /// When absent, the coord allocates a random 3-character nameplate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

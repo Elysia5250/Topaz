@@ -207,6 +207,101 @@ pub fn pinned_client_config(pin: [u8; 20]) -> Result<rustls::ClientConfig> {
     Ok(config)
 }
 
+/// Perform a one-shot TLS 1.3 handshake with `coord_url` to learn its Ed25519
+/// certificate pin for SSH-style trust-on-first-use (TOFU) confirmation.
+pub async fn probe_coord_pin(coord_url: &str) -> Result<String> {
+    use std::sync::Mutex;
+    use tokio::net::TcpStream;
+    use tokio_rustls::TlsConnector;
+    use topaz_proto::auth::{format_pin, pin_bytes};
+
+    #[derive(Debug)]
+    struct CaptureVerifier(Mutex<Option<[u8; 20]>>);
+
+    impl ServerCertVerifier for CaptureVerifier {
+        fn verify_server_cert(
+            &self,
+            end_entity: &CertificateDer<'_>,
+            _: &[CertificateDer<'_>],
+            _: &ServerName<'_>,
+            _: &[u8],
+            _: UnixTime,
+        ) -> Result<ServerCertVerified, Error> {
+            let pk = ed25519_spki_key(end_entity.as_ref())
+                .ok_or_else(|| Error::InvalidCertificate(CertificateError::BadEncoding))?;
+            *self.0.lock().unwrap() = Some(pin_bytes(&pk));
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer<'_>,
+            _: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            Err(Error::PeerIncompatible(
+                rustls::PeerIncompatible::Tls13RequiredForQuic,
+            ))
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            verify_handshake(message, cert, dss)
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            vec![SignatureScheme::ED25519]
+        }
+    }
+
+    let rest = coord_url
+        .trim()
+        .strip_prefix("https://")
+        .ok_or_else(|| anyhow::anyhow!("coord URL must start with https://"))?;
+    let hostport = rest.split('/').next().unwrap_or(rest).trim();
+    let addr = if hostport.starts_with('[') {
+        if hostport.contains("]:") {
+            hostport.to_string()
+        } else {
+            format!("{hostport}:443")
+        }
+    } else if hostport.contains(':') {
+        hostport.to_string()
+    } else {
+        format!("{hostport}:443")
+    };
+
+    let capture = Arc::new(CaptureVerifier(Mutex::new(None)));
+    let mut cfg = rustls::ClientConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .dangerous()
+        .with_custom_certificate_verifier(capture.clone())
+        .with_no_client_auth();
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+    let tcp = tokio::time::timeout(std::time::Duration::from_secs(10), TcpStream::connect(&addr))
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out connecting to {addr}"))??;
+    let connector = TlsConnector::from(Arc::new(cfg));
+    let _tls = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        connector.connect(ServerName::try_from("topaz-coord")?, tcp),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("TLS handshake timed out for {addr}"))??;
+
+    let pin = capture
+        .0
+        .lock()
+        .unwrap()
+        .ok_or_else(|| anyhow::anyhow!("coord did not present an Ed25519 certificate"))?;
+    Ok(format_pin(&pin))
+}
+
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
