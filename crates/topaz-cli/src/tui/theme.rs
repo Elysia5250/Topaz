@@ -16,7 +16,6 @@ impl ThemeKind {
         match name.trim().to_ascii_lowercase().as_str() {
             "tokyonight" | "tokyo-night" | "tokyo" => Self::TokyoNight,
             "light" => Self::Light,
-            // Default to `ink` (also maps legacy "opencode" cleanly).
             _ => Self::Ink,
         }
     }
@@ -53,6 +52,13 @@ pub struct Theme {
     pub bg: Color,
     pub panel: Color,
     pub link: Color,
+    /// Subtle semantic pill backgrounds harmonised with each palette.
+    pub ok_bg: Color,
+    pub warn_bg: Color,
+    pub bad_bg: Color,
+    pub accent_bg: Color,
+    /// High-contrast foreground used on solid accent buttons.
+    pub accent_fg: Color,
 }
 
 impl Theme {
@@ -72,6 +78,11 @@ impl Theme {
                 bg: Color::Rgb(0x0d, 0x10, 0x15),
                 panel: Color::Rgb(0x13, 0x18, 0x22),
                 link: Color::Rgb(0x73, 0xd0, 0xff),
+                ok_bg: Color::Rgb(0x13, 0x2a, 0x1e),
+                warn_bg: Color::Rgb(0x2b, 0x23, 0x14),
+                bad_bg: Color::Rgb(0x2e, 0x16, 0x1b),
+                accent_bg: Color::Rgb(0x16, 0x2d, 0x2a),
+                accent_fg: Color::Rgb(0x0d, 0x10, 0x15),
             },
             ThemeKind::TokyoNight => Self {
                 accent: Color::Rgb(0x7a, 0xa2, 0xf7),
@@ -87,6 +98,11 @@ impl Theme {
                 bg: Color::Rgb(0x1a, 0x1b, 0x26),
                 panel: Color::Rgb(0x1f, 0x23, 0x35),
                 link: Color::Rgb(0x7d, 0xcf, 0xff),
+                ok_bg: Color::Rgb(0x1a, 0x2b, 0x22),
+                warn_bg: Color::Rgb(0x31, 0x29, 0x1c),
+                bad_bg: Color::Rgb(0x30, 0x1a, 0x24),
+                accent_bg: Color::Rgb(0x22, 0x2d, 0x4b),
+                accent_fg: Color::Rgb(0x1a, 0x1b, 0x26),
             },
             ThemeKind::Light => Self {
                 accent: Color::Rgb(0x3b, 0x5f, 0xc4),
@@ -102,6 +118,11 @@ impl Theme {
                 bg: Color::Rgb(0xff, 0xff, 0xff),
                 panel: Color::Rgb(0xf5, 0xf6, 0xf9),
                 link: Color::Rgb(0x09, 0x69, 0xda),
+                ok_bg: Color::Rgb(0xe6, 0xf6, 0xea),
+                warn_bg: Color::Rgb(0xfc, 0xf3, 0xdc),
+                bad_bg: Color::Rgb(0xfd, 0xec, 0xed),
+                accent_bg: Color::Rgb(0xe4, 0xeb, 0xfb),
+                accent_fg: Color::Rgb(0xff, 0xff, 0xff),
             },
         }
     }

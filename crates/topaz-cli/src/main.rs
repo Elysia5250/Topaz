@@ -9,21 +9,20 @@ mod tui;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use topaz_core::{
-    generate_recovery_code, issue_cert, issue_revocation, AccountInfo, AccountKey, Store,
-};
-use topaz_net::{
-    approve_new_device, approve_with_secret, join_with_code, join_with_secret, probe_coord_pin,
-};
-use topaz_proto::auth::{format_pin, parse_pin};
-use topaz_proto::CreateAccountRequest;
-use serde_json::json;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
+use topaz_core::{issue_cert, issue_revocation, AccountInfo, AccountKey, Store};
+use topaz_net::{
+    approve_new_device, approve_with_secret, join_with_code, join_with_secret_with_sas,
+    probe_coord_pin,
+};
+use topaz_proto::auth::{format_pin, parse_pin};
+use zeroize::Zeroize;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "topaz",
+    version = topaz_proto::VERSION_LONG,
     about = "Topaz Session Engine — pure-network P2P device fabric (QUIC/mTLS/STUN/mDNS/relay)"
 )]
 struct Cli {
@@ -113,12 +112,12 @@ enum Commands {
     },
     /// Diagnose this device, coord reachability, STUN, mDNS, and peer endpoints.
     Doctor,
-    /// Manage user-level autostart for the daemon.
+    /// Manage user-level or system-level autostart for the daemon.
     Service {
         #[command(subcommand)]
         cmd: ServiceCmd,
     },
-    /// Live terminal UI connected to the running daemon over control.sock.
+    /// Full-lifecycle interactive terminal UI (onboarding, daemon, pairing, doctor, logs).
     Tui {
         /// Color theme override ("ink", "tokyonight", or "light").
         #[arg(long)]
@@ -156,8 +155,15 @@ pub enum ServiceCmd {
         /// Do not start the TUN device (control.sock + sessions only).
         #[arg(long)]
         no_tun: bool,
+        /// Install as a system service (systemd with CAP_NET_ADMIN / macOS LaunchDaemon; requires sudo).
+        #[arg(long)]
+        system: bool,
     },
-    Uninstall,
+    Uninstall {
+        /// Uninstall the system-level service (requires sudo).
+        #[arg(long)]
+        system: bool,
+    },
     Status,
 }
 
@@ -217,13 +223,17 @@ async fn main() -> Result<()> {
     let data_dir = cli.data_dir.unwrap_or_else(Store::default_data_dir);
 
     let Some(cmd) = cli.cmd else {
-        if client::ControlClient::try_daemon(&data_dir).await.is_some() {
+        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
             return tui::cmd_tui(data_dir, None).await;
         }
-        println!("topaz daemon is not running for {}", data_dir.display());
-        println!("  start (no TUN):  topaz run --no-tun --detach");
-        println!("  start (VPN TUN): sudo topaz run --detach");
-        println!("  all commands:    topaz --help");
+        if client::ControlClient::try_daemon(&data_dir).await.is_some() {
+            println!("topaz daemon is running for {}", data_dir.display());
+        } else {
+            println!("topaz daemon is not running for {}", data_dir.display());
+            println!("  interactive TUI: topaz");
+            println!("  start (no TUN):  topaz run --no-tun --detach");
+            println!("  start (VPN TUN): sudo topaz run --detach");
+        }
         return Ok(());
     };
 
@@ -309,17 +319,9 @@ fn read_recovery_code() -> Result<AccountKey> {
     std::io::stderr().flush()?;
     let mut line = String::new();
     std::io::stdin().lock().read_line(&mut line)?;
-    AccountKey::from_recovery(line.trim())
-}
-
-fn ensure_no_account(store: &Store) -> Result<()> {
-    if let Some(a) = &store.account {
-        bail!(
-            "this device already belongs to account {}; use a fresh --data-dir to join another",
-            a.user_id
-        );
-    }
-    Ok(())
+    let res = AccountKey::from_recovery(line.trim());
+    line.zeroize();
+    res
 }
 
 fn cmd_init(
@@ -330,10 +332,11 @@ fn cmd_init(
 ) -> Result<()> {
     let mut store = Store::open(data_dir.clone())?;
     if let Some(u) = coord_url {
-        if !u.starts_with("https://") {
+        let norm = ops::normalize_coord_arg(&u);
+        if !norm.starts_with("https://") {
             bail!("coord URL must start with https://");
         }
-        store.config.coord_url = u;
+        store.config.coord_url = norm;
     }
     if let Some(p) = pin {
         let bytes = parse_pin(&p).ok_or_else(|| anyhow::anyhow!("pin is malformed"))?;
@@ -355,56 +358,22 @@ async fn cmd_account_create(
     pin: Option<String>,
     name: Option<String>,
 ) -> Result<()> {
-    let mut store = Store::open(data_dir)?;
-    ensure_no_account(&store)?;
-    let mut changed = false;
-    if let Some(u) = coord_url {
-        if !u.starts_with("https://") {
-            bail!("coord URL must start with https://");
-        }
-        store.config.coord_url = u;
-        changed = true;
-    }
-    if let Some(p) = pin {
-        let bytes = parse_pin(&p).ok_or_else(|| {
-            anyhow::anyhow!("invalid pin (expected 32 base32 chars from `topaz-coord fingerprint`)")
-        })?;
-        store.config.coord_pin = format_pin(&bytes);
-        changed = true;
-    }
-    if let Some(n) = name {
-        store.config.device_name = n;
-        changed = true;
-    }
-    if changed {
-        store.save_config()?;
-    }
-    let coord = ops::coord_client(&store)?;
-    let recovery = generate_recovery_code();
-    let root = AccountKey::from_recovery(&recovery)?;
-    let cert = issue_cert(
-        &root.signing,
-        &root.user_id,
-        &root.user_pubkey,
-        &store.identity.pubkey_hex,
-        &store.device_name(),
-    )?;
-    coord
-        .create_account(&CreateAccountRequest {
-            invite,
-            cert: cert.clone(),
-        })
-        .await
-        .context("create account")?;
-    let info = AccountInfo::from_cert(&store.identity, cert)?;
+    let (info, mut recovery) = ops::create_account_direct(
+        &data_dir,
+        &invite,
+        coord_url.as_deref(),
+        pin.as_deref(),
+        name.as_deref(),
+    )
+    .await?;
     println!("account {} created", info.user_id);
-    store.save_account(info)?;
     println!();
     println!("recovery code (write it down; it is not stored anywhere):");
     println!();
     println!("    {recovery}");
     println!();
     println!("Use it to add a device when no other device is online, or to revoke a lost one.");
+    recovery.zeroize();
     Ok(())
 }
 
@@ -447,44 +416,7 @@ async fn cmd_device_add(data_dir: PathBuf) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn setup_bundle(store: &Store, code: &str) -> String {
-    use base64::Engine as _;
-    let payload = json!({
-        "url": store.config.coord_url,
-        "pin": store.config.coord_pin,
-        "code": code,
-        "by": store.identity.device_id,
-        "by_name": store.config.device_name,
-    });
-    format!(
-        "topaz-setup:v1:{}",
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string())
-    )
-}
-
-#[derive(serde::Deserialize)]
-struct SetupBundle {
-    url: String,
-    pin: String,
-    code: String,
-    #[allow(dead_code)]
-    by: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    by_name: String,
-}
-
-fn parse_setup_bundle(raw: &str) -> Result<SetupBundle> {
-    use base64::Engine as _;
-    let s = raw.trim().trim_matches(|c| c == '\'' || c == '"');
-    let body = s.strip_prefix("topaz-setup:v1:").with_context(|| {
-        "not an topaz-setup:v1 bundle (print one with `topaz device add`)"
-    })?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(body)
-        .context("bundle is not valid base64")?;
-    serde_json::from_slice(&bytes).context("bundle payload is malformed")
-}
+pub(crate) use ops::setup_bundle;
 
 async fn cmd_setup(
     data_dir: PathBuf,
@@ -494,33 +426,24 @@ async fn cmd_setup(
     start: bool,
     no_tun: bool,
 ) -> Result<()> {
-    let b = parse_setup_bundle(&bundle)?;
-    if !b.url.starts_with("https://") {
-        bail!("bundle coord URL is not https://: {}", b.url);
-    }
-    let pin = parse_pin(&b.pin).ok_or_else(|| anyhow::anyhow!("bundle pin is malformed"))?;
-
-    let mut store = Store::open(data_dir.clone())?;
-    ensure_no_account(&store)?;
-    store.config.coord_url = b.url.clone();
-    store.config.coord_pin = format_pin(&pin);
-    if let Some(n) = &name {
-        store.config.device_name = n.clone();
-    }
-    store.save_config()?;
-
-    let coord = ops::coord_client(&store)?;
-    let name = store.device_name();
-    let cert = join_with_code(&coord, &store.identity, &name, &b.code).await?;
-    let info = AccountInfo::from_cert(&store.identity, cert)?;
+    let info = ops::join_with_setup_bundle(&data_dir, &bundle, name.as_deref()).await?;
+    let store = Store::open(data_dir.clone())?;
     println!(
         "joined account {} as {} ({})",
-        info.user_id, store.identity.device_id, name
+        info.user_id,
+        store.identity.device_id,
+        store.device_name()
     );
-    store.save_account(info)?;
 
     if install {
-        service::cmd_service(data_dir, ServiceCmd::Install { no_tun: true }).await?;
+        service::cmd_service(
+            data_dir,
+            ServiceCmd::Install {
+                no_tun: true,
+                system: false,
+            },
+        )
+        .await?;
     } else if start {
         let vpn_cfg = topaz_vpn::VpnConfig {
             disabled: no_tun,
@@ -531,31 +454,24 @@ async fn cmd_setup(
         run::spawn_detached(data_dir, None, false, true, vpn_cfg).await?;
     } else {
         println!(
-            "start the node with `topaz run --detach`, or `topaz service install` for autostart"
+            "start the node with `topaz` (TUI), `topaz run --detach`, or `topaz service install`"
         );
     }
     Ok(())
 }
 
 async fn cmd_stop(data_dir: PathBuf) -> Result<()> {
-    let Some(daemon) = client::ControlClient::try_daemon(&data_dir).await else {
+    if run::stop_daemon_quiet(&data_dir).await? {
+        println!("topaz daemon stopped");
+    } else {
         println!("topaz daemon is not running");
-        return Ok(());
-    };
-    let _ = daemon.post("/v1/shutdown", None).await;
-    for _ in 0..50 {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if client::ControlClient::try_daemon(&data_dir).await.is_none() {
-            println!("topaz daemon stopped");
-            return Ok(());
-        }
     }
-    bail!("daemon did not exit within 5 seconds");
+    Ok(())
 }
 
 async fn cmd_join(data_dir: PathBuf, code: Option<String>, recovery: bool) -> Result<()> {
     let mut store = Store::open(data_dir)?;
-    ensure_no_account(&store)?;
+    ops::ensure_no_account(&store)?;
     let coord = ops::coord_client(&store)?;
     let name = store.device_name();
     let cert = if recovery {
@@ -583,24 +499,6 @@ async fn cmd_join(data_dir: PathBuf, code: Option<String>, recovery: bool) -> Re
     );
     store.save_account(info)?;
     Ok(())
-}
-
-fn normalize_coord_arg(raw: &str) -> String {
-    let s = raw.trim().trim_end_matches('/');
-    if s.starts_with("https://") || s.starts_with("http://") {
-        return s.to_string();
-    }
-    if s.starts_with('[') {
-        if s.contains("]:") {
-            format!("https://{s}")
-        } else {
-            format!("https://{s}:7722")
-        }
-    } else if s.contains(':') {
-        format!("https://{s}")
-    } else {
-        format!("https://{s}:7722")
-    }
 }
 
 fn confirm_prompt(prompt: &str) -> Result<bool> {
@@ -637,20 +535,24 @@ async fn cmd_pair(
         println!("waiting for peer with phrase '{phrase}' on {coord_display} (up to 5 min)...");
         println!(
             "on the new device run:\n  topaz pair {} {phrase}",
-            coord_display
-                .strip_prefix("https://")
-                .unwrap_or(&coord_display)
-                .strip_suffix(":7722")
-                .unwrap_or(coord_display.strip_prefix("https://").unwrap_or(&coord_display))
+            ops::coord_short_host(&coord_display)
         );
         let _ = std::io::stdout().flush();
 
-        let cert = approve_with_secret(&coord, &store.identity, &account, &phrase, |dev_name, dev_id| {
-            if yes {
-                return Ok(true);
-            }
-            confirm_prompt(&format!("Approve '{dev_name}' ({dev_id}) to join this account?"))
-        })
+        let cert = approve_with_secret(
+            &coord,
+            &store.identity,
+            &account,
+            &phrase,
+            |dev_name, dev_id, sas| {
+                if yes {
+                    return Ok(true);
+                }
+                confirm_prompt(&format!(
+                    "Approve '{dev_name}' ({dev_id}) [verify code: {sas}] to join this account?"
+                ))
+            },
+        )
         .await?;
         println!("added {} ({})", cert.name, cert.device_id);
         return Ok(());
@@ -663,7 +565,7 @@ async fn cmd_pair(
     };
 
     if let Some(raw_coord) = coord_arg {
-        let url = normalize_coord_arg(&raw_coord);
+        let url = ops::normalize_coord_arg(&raw_coord);
         if !url.starts_with("https://") {
             bail!("coord URL must start with https:// (got {url})");
         }
@@ -693,12 +595,16 @@ async fn cmd_pair(
     let coord = ops::coord_client(&store)?;
     let my_name = store.device_name();
     println!(
-        "waiting to pair as '{my_name}' with phrase '{phrase}' on {} (up to 5 min)...",
-        store.config.coord_url
+        "waiting to pair as '{my_name}' ({}) with phrase '{phrase}' on {} (up to 5 min)...",
+        store.identity.device_id, store.config.coord_url
     );
     let _ = std::io::stdout().flush();
 
-    let cert = join_with_secret(&coord, &store.identity, &my_name, &phrase).await?;
+    let cert = join_with_secret_with_sas(&coord, &store.identity, &my_name, &phrase, |sas| {
+        println!("verification code: {sas} (confirm this matches the approving device)");
+        let _ = std::io::stdout().flush();
+    })
+    .await?;
     let info = AccountInfo::from_cert(&store.identity, cert)?;
     println!(
         "joined account {} as {} ({})",

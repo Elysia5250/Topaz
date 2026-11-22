@@ -61,7 +61,7 @@ pub async fn bind_socket(path: &FilePath) -> Result<tokio::net::UnixListener> {
 #[cfg(unix)]
 fn configure_socket_permissions(path: &FilePath) {
     use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660));
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     topaz_core::chown_to_sudo_user(path);
 }
 
@@ -357,12 +357,16 @@ mod tests {
                 relay: RelayAddrs {
                     tcp: "127.0.0.1:1".into(),
                     ws: "wss://127.0.0.1:1".into(),
+                    quic: String::new(),
                     coord_tls: coord.tls_config(),
+                    coord_quic_tls: None,
                 },
                 signal_tx,
                 signal_rx,
                 force_relay: true,
                 enable_mdns: false,
+                initial_devices: Vec::new(),
+                on_devices_cached: None,
             },
             |_handle| {
                 let ping = Arc::new(PingService::new(status.clone()));
@@ -683,6 +687,7 @@ mod tests {
                                         observed_ip: "127.0.0.1".into(),
                                         relay: "tcp://127.0.0.1:1".into(),
                                         relay_ws: "wss://127.0.0.1:1/v1/relay".into(),
+                                        relay_quic: String::new(),
                                         stun: String::new(),
                                     };
                                     let json = serde_json::to_vec(&resp).unwrap();
@@ -805,7 +810,9 @@ mod tests {
             let relay = RelayAddrs {
                 tcp: "127.0.0.1:1".into(),
                 ws: "wss://127.0.0.1:1/v1/relay".into(),
+                quic: String::new(),
                 coord_tls: client.tls_config(),
+                coord_quic_tls: None,
             };
             let status = Arc::new(SharedStatus::new());
             let st_for_svc = status.clone();
@@ -822,6 +829,8 @@ mod tests {
                     signal_rx: sig_in,
                     force_relay: false,
                     enable_mdns: false,
+                    initial_devices: Vec::new(),
+                    on_devices_cached: None,
                 },
                 move |_| vec![Arc::new(PingService::new(st_for_svc)) as Arc<dyn Service>],
                 status.clone(),

@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 use tun_rs::{AsyncDevice, DeviceBuilder};
 
 use crate::dns::{bind_dns_socket, configure_system_dns, serve_dns};
-use crate::route::{OutboundAction, RouteTable};
+use crate::route::{build_icmp_frag_needed, OutboundAction, RouteTable};
 use crate::{SharedVpnStatus, VpnConfig, VpnStatus};
 
 const INBOUND_DATAGRAM_QUEUE: usize = 1024;
@@ -23,17 +23,28 @@ pub(crate) async fn run_vpn_loop(
     status: Arc<SharedStatus>,
     vpn_status: SharedVpnStatus,
     cfg: VpnConfig,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let routes = Arc::new(RwLock::new(RouteTable::from_status(&status.engine())));
 
-    // Wait until coord IPAM populates our own 100.64.x.y address.
+    // Wait until coord IPAM populates our own 100.64.x.y address (or shutdown).
     let self_ip = loop {
+        if *shutdown.borrow() {
+            return;
+        }
         let eng = status.engine();
         *routes.write().unwrap() = RouteTable::from_status(&eng);
         if let Some(ip) = routes.read().unwrap().self_ip() {
             break ip;
         }
-        status.changed().await;
+        tokio::select! {
+            _ = status.changed() => {}
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
     };
 
     let dev = match open_tun(self_ip, &cfg) {
@@ -111,6 +122,16 @@ pub(crate) async fn run_vpn_loop(
                             guard.route_outbound(pkt)
                         };
                         if let OutboundAction::Forward { peer_id } = action {
+                            if let Some(max_sz) = engine.peer_max_datagram(&peer_id) {
+                                if pkt.len() > max_sz {
+                                    let next_mtu = (max_sz.min(u16::MAX as usize) as u16).max(576);
+                                    if let Some(icmp) = build_icmp_frag_needed(pkt, next_mtu) {
+                                        let _ = dev.send(&icmp).await;
+                                    }
+                                    debug!(peer = %peer_id, len = n, max_sz, "sent ICMP Fragmentation Needed for oversized packet");
+                                    continue;
+                                }
+                            }
                             if let Err(e) = engine.send_datagram(&peer_id, Bytes::copy_from_slice(pkt)) {
                                 debug!(peer = %peer_id, len = n, error = %e, "outbound packet not sent");
                             }
@@ -138,6 +159,12 @@ pub(crate) async fn run_vpn_loop(
             _ = status.changed() => {
                 let eng = status.engine();
                 *routes.write().unwrap() = RouteTable::from_status(&eng);
+            }
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    info!(iface = %iface, "VPN loop received shutdown signal; cleaning up");
+                    break;
+                }
             }
         }
     }

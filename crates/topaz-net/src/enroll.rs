@@ -7,9 +7,10 @@
 
 use crate::coord::CoordClient;
 use anyhow::{anyhow, bail, Context, Result};
+use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-use rand::Rng;
+use rand::{Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 use std::time::{Duration, Instant};
@@ -128,6 +129,20 @@ pub async fn approve_new_device(
     Ok(cert)
 }
 
+fn generate_finish_token() -> String {
+    let mut bytes = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+/// Derive a 6-digit Short Authentication String (`NNN-NNN`) from the SPAKE2
+/// shared key so both users can visually confirm there is no MitM.
+pub fn derive_sas(shared: &[u8]) -> String {
+    let digest = blake3::derive_key("topaz pair sas v1", shared);
+    let num = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) % 1_000_000;
+    format!("{:03}-{:03}", num / 1000, num % 1000)
+}
+
 /// Run on the new device with the code shown by an existing device.
 pub async fn join_with_code(
     coord: &CoordClient,
@@ -146,17 +161,19 @@ pub async fn join_with_code(
         device_pubkey: identity.pubkey_hex.clone(),
         name: name.to_string(),
     };
+    let finish_token = generate_finish_token();
     coord
         .enroll_reply(
             &nameplate,
             &EnrollReply {
                 msg_b: hex::encode(msg_b),
                 payload: seal(&shared, NONCE_NEW, &serde_json::to_vec(&request)?)?,
+                finish_token: finish_token.clone(),
             },
         )
         .await?;
 
-    let payload = poll(|| coord.enroll_get_finish(&nameplate)).await?;
+    let payload = poll(|| coord.enroll_get_finish(&nameplate, &finish_token)).await?;
     let cert: DeviceCert = serde_json::from_slice(&open(&shared, NONCE_EXISTING, &payload)?)
         .context("malformed certificate")?;
     Ok(cert)
@@ -165,31 +182,77 @@ pub async fn join_with_code(
 /// Normalize a user-chosen pairing phrase (case-insensitive, trimmed).
 pub fn normalize_secret(secret: &str) -> Result<String> {
     let cleaned = secret.trim().to_ascii_lowercase();
-    if cleaned.len() < 4 {
-        bail!("pairing phrase must be at least 4 characters");
+    if cleaned.len() < 6 {
+        bail!("pairing phrase must be at least 6 characters");
     }
     Ok(cleaned)
 }
 
-/// Derive an opaque 24-hex-char room key from a user-chosen pairing phrase so
-/// the coord never sees the plaintext secret.
+/// Derive an opaque 24-hex-char room key from a user-chosen pairing phrase
+/// using Argon2id (19 MiB, t=2, p=1) so the coord never sees the plaintext
+/// secret and offline dictionary attacks against the room key are expensive.
 pub fn pair_room_key(normalized_secret: &str) -> String {
-    let digest = blake3::derive_key("topaz pair room v1", normalized_secret.as_bytes());
-    hex::encode(&digest[..12])
+    const SALT: &[u8] = b"topaz-pair-room-argon2id-v2";
+    let params = Params::new(19 * 1024, 2, 1, Some(32)).expect("valid argon2 params");
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut out = [0u8; 32];
+    argon2
+        .hash_password_into(normalized_secret.as_bytes(), SALT, &mut out)
+        .expect("argon2 hash failed");
+    hex::encode(&out[..12])
 }
 
-/// Approve a new device using a user-chosen pairing phrase (both sides enter
-/// the same phrase; the coord only sees a derived room key and SPAKE2 traffic).
-/// `confirm` is called with `(device_name, device_id)` before signing the cert.
-pub async fn approve_with_secret(
+async fn pair_room_key_async(normalized_secret: String) -> Result<String> {
+    tokio::task::spawn_blocking(move || pair_room_key(&normalized_secret))
+        .await
+        .map_err(|e| anyhow!("kdf task failed: {e}"))
+}
+
+/// Decrypted incoming phrase-pairing request waiting for explicit user approval.
+pub struct PendingSecretApproval {
+    coord: CoordClient,
+    identity: DeviceIdentity,
+    account: AccountInfo,
+    nameplate: String,
+    shared: Vec<u8>,
+    pub device_pubkey: String,
+    pub device_name: String,
+    pub device_id: String,
+    /// 6-digit Short Authentication String derived from the SPAKE2 key.
+    pub sas: String,
+}
+
+impl PendingSecretApproval {
+    /// Sign and publish the new device certificate and finish the SPAKE2 exchange.
+    pub async fn approve(self) -> Result<DeviceCert> {
+        let cert = issue_cert(
+            &self.identity.signing,
+            &self.account.user_id,
+            &self.account.user_pubkey,
+            &self.device_pubkey,
+            &self.device_name,
+        )?;
+        self.coord.add_device(&cert).await?;
+        self.coord
+            .enroll_finish(
+                &self.nameplate,
+                seal(&self.shared, NONCE_EXISTING, &serde_json::to_vec(&cert)?)?,
+            )
+            .await?;
+        Ok(cert)
+    }
+}
+
+/// Stage 1 of phrase pairing: publish a derived room on coord and wait for the
+/// joining device to complete SPAKE2 key exchange and send its name & pubkey.
+pub async fn wait_secret_pair_request(
     coord: &CoordClient,
     identity: &DeviceIdentity,
     account: &AccountInfo,
     secret: &str,
-    confirm: impl FnOnce(&str, &str) -> Result<bool>,
-) -> Result<DeviceCert> {
+) -> Result<PendingSecretApproval> {
     let pw = normalize_secret(secret)?;
-    let room = pair_room_key(&pw);
+    let room = pair_room_key_async(pw.clone()).await?;
     let (state, msg_a) = Spake2::<Ed25519Group>::start_a(
         &Password::new(pw.as_bytes()),
         &Identity::new(ID_A),
@@ -204,26 +267,80 @@ pub async fn approve_with_secret(
     let req: JoinRequest = serde_json::from_slice(&open(&shared, NONCE_NEW, &reply.payload)?)
         .context("malformed join request")?;
 
-    let new_device_id = topaz_proto::auth::derive_id_hex(&req.device_pubkey)
+    let device_id = topaz_proto::auth::derive_id_hex(&req.device_pubkey)
         .ok_or_else(|| anyhow!("new device sent malformed public key"))?;
-    if !confirm(&req.name, &new_device_id)? {
+    let sas = derive_sas(&shared);
+    Ok(PendingSecretApproval {
+        coord: coord.clone(),
+        identity: identity.clone(),
+        account: account.clone(),
+        nameplate,
+        shared,
+        device_pubkey: req.device_pubkey,
+        device_name: req.name,
+        device_id,
+        sas,
+    })
+}
+
+/// Approve a new device using a user-chosen pairing phrase (both sides enter
+/// the same phrase; the coord only sees an Argon2id-derived room key and SPAKE2
+/// traffic). `confirm` is called with `(device_name, device_id, sas)` before
+/// signing the cert.
+pub async fn approve_with_secret(
+    coord: &CoordClient,
+    identity: &DeviceIdentity,
+    account: &AccountInfo,
+    secret: &str,
+    confirm: impl FnOnce(&str, &str, &str) -> Result<bool>,
+) -> Result<DeviceCert> {
+    let pending = wait_secret_pair_request(coord, identity, account, secret).await?;
+    if !confirm(&pending.device_name, &pending.device_id, &pending.sas)? {
         bail!("pairing rejected by user");
     }
+    pending.approve().await
+}
 
-    let cert = issue_cert(
-        &identity.signing,
-        &account.user_id,
-        &account.user_pubkey,
-        &req.device_pubkey,
-        &req.name,
-    )?;
-    coord.add_device(&cert).await?;
+/// Join an existing account using a user-chosen pairing phrase, invoking
+/// `on_sas` once the SPAKE2 shared key and 6-digit verification code are ready.
+pub async fn join_with_secret_with_sas(
+    coord: &CoordClient,
+    identity: &DeviceIdentity,
+    name: &str,
+    secret: &str,
+    on_sas: impl FnOnce(&str),
+) -> Result<DeviceCert> {
+    let pw = normalize_secret(secret)?;
+    let room = pair_room_key_async(pw.clone()).await?;
+    let msg_a = poll(|| coord.enroll_offer_opt(&room)).await?;
+    let (state, msg_b) = Spake2::<Ed25519Group>::start_b(
+        &Password::new(pw.as_bytes()),
+        &Identity::new(ID_A),
+        &Identity::new(ID_B),
+    );
+    let shared = state
+        .finish(&hex::decode(&msg_a)?)
+        .map_err(|_| anyhow!("key exchange failed"))?;
+    on_sas(&derive_sas(&shared));
+    let request = JoinRequest {
+        device_pubkey: identity.pubkey_hex.clone(),
+        name: name.to_string(),
+    };
+    let finish_token = generate_finish_token();
     coord
-        .enroll_finish(
-            &nameplate,
-            seal(&shared, NONCE_EXISTING, &serde_json::to_vec(&cert)?)?,
+        .enroll_reply(
+            &room,
+            &EnrollReply {
+                msg_b: hex::encode(msg_b),
+                payload: seal(&shared, NONCE_NEW, &serde_json::to_vec(&request)?)?,
+                finish_token: finish_token.clone(),
+            },
         )
         .await?;
+
+    let payload = poll(|| coord.enroll_get_finish(&room, &finish_token)).await?;
+    let cert: DeviceCert = serde_json::from_slice(&open(&shared, NONCE_EXISTING, &payload)?)
+        .context("malformed certificate")?;
     Ok(cert)
 }
 
@@ -235,35 +352,7 @@ pub async fn join_with_secret(
     name: &str,
     secret: &str,
 ) -> Result<DeviceCert> {
-    let pw = normalize_secret(secret)?;
-    let room = pair_room_key(&pw);
-    let msg_a = poll(|| coord.enroll_offer_opt(&room)).await?;
-    let (state, msg_b) = Spake2::<Ed25519Group>::start_b(
-        &Password::new(pw.as_bytes()),
-        &Identity::new(ID_A),
-        &Identity::new(ID_B),
-    );
-    let shared = state
-        .finish(&hex::decode(&msg_a)?)
-        .map_err(|_| anyhow!("key exchange failed"))?;
-    let request = JoinRequest {
-        device_pubkey: identity.pubkey_hex.clone(),
-        name: name.to_string(),
-    };
-    coord
-        .enroll_reply(
-            &room,
-            &EnrollReply {
-                msg_b: hex::encode(msg_b),
-                payload: seal(&shared, NONCE_NEW, &serde_json::to_vec(&request)?)?,
-            },
-        )
-        .await?;
-
-    let payload = poll(|| coord.enroll_get_finish(&room)).await?;
-    let cert: DeviceCert = serde_json::from_slice(&open(&shared, NONCE_EXISTING, &payload)?)
-        .context("malformed certificate")?;
-    Ok(cert)
+    join_with_secret_with_sas(coord, identity, name, secret, |_| {}).await
 }
 
 #[cfg(test)]

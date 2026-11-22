@@ -19,6 +19,7 @@ BIN_SRC=""
 PUBLIC_URL=""
 LISTEN_PORT="7722"
 RELAY_PORT="7723"
+RELAY_QUIC_PORT="7724"
 STUN_PORT="3478"
 ENABLE_WS_443="false"
 RELAY_MBPS="50"
@@ -43,6 +44,7 @@ Options:
   --public-url <URL>     Public coord URL printed with invite codes (e.g. https://1.2.3.4:7722)
   --port <PORT>          HTTPS/WSS control-plane port (default: 7722)
   --relay-port <PORT>    TCP relay port (default: 7723)
+  --relay-quic-port <P>  UDP/QUIC datagram relay port (default: 7724)
   --stun-port <PORT>     UDP STUN port (default: 3478)
   --ws-443               Also listen for WSS relay on 0.0.0.0:443 (adds CAP_NET_BIND_SERVICE)
   --relay-mbps <N>       Per-account relay bandwidth cap in Mbit/s (default: 50)
@@ -59,6 +61,7 @@ while [[ $# -gt 0 ]]; do
         --public-url) PUBLIC_URL="$2"; shift 2 ;;
         --port) LISTEN_PORT="$2"; shift 2 ;;
         --relay-port) RELAY_PORT="$2"; shift 2 ;;
+        --relay-quic-port) RELAY_QUIC_PORT="$2"; shift 2 ;;
         --stun-port) STUN_PORT="$2"; shift 2 ;;
         --ws-443) ENABLE_WS_443="true"; shift ;;
         --relay-mbps) RELAY_MBPS="$2"; shift 2 ;;
@@ -106,8 +109,15 @@ download_release_binary() {
             cd "$TMP_DIR"
             grep "  ${asset}\$" SHA256SUMS.txt | sha256sum -c -
         )
+    elif command -v shasum >/dev/null 2>&1; then
+        echo "Verifying SHA256 checksum (shasum)..."
+        (
+            cd "$TMP_DIR"
+            grep "  ${asset}\$" SHA256SUMS.txt | shasum -a 256 -c -
+        )
     else
-        echo "Warning: sha256sum not found; skipping checksum verification." >&2
+        echo "Error: neither sha256sum nor shasum found; refusing to install unverified binary." >&2
+        exit 1
     fi
 
     chmod 0755 "${TMP_DIR}/${asset}"
@@ -155,6 +165,7 @@ if [[ ! -f "$ENV_FILE" ]]; then
 # Topaz coordination & relay server configuration
 COORD_LISTEN=0.0.0.0:${LISTEN_PORT}
 COORD_RELAY_LISTEN=0.0.0.0:${RELAY_PORT}
+COORD_RELAY_QUIC_LISTEN=0.0.0.0:${RELAY_QUIC_PORT}
 COORD_STUN_LISTEN=0.0.0.0:${STUN_PORT}
 COORD_DB=/var/lib/topaz-coord/coord.db
 COORD_RELAY_MBPS_PER_ACCOUNT=${RELAY_MBPS}
@@ -219,6 +230,7 @@ sleep 1
 
 echo ""
 echo "=== topaz-coord is running ==="
+echo "Version: $(/usr/local/bin/topaz-coord version 2>/dev/null || /usr/local/bin/topaz-coord --version 2>/dev/null || echo unknown)"
 systemctl --no-pager --lines=5 status topaz-coord.service || true
 echo ""
 PIN="$(sudo -u topaz bash -c 'set -a; source /etc/topaz-coord/coord.env; /usr/local/bin/topaz-coord fingerprint' 2>/dev/null || true)"
@@ -227,6 +239,7 @@ echo ""
 echo "Open these firewall ports on your VPS:"
 echo "  - ${LISTEN_PORT}/tcp   (HTTPS control plane + WSS signaling/relay)"
 echo "  - ${RELAY_PORT}/tcp   (TCP relay)"
+echo "  - ${RELAY_QUIC_PORT}/udp   (UDP/QUIC datagram relay for VPN)"
 echo "  - ${STUN_PORT}/udp   (UDP STUN for NAT hole punching)"
 if [[ -n "$CAP_LINE" ]]; then
     echo "  - 443/tcp    (Extra WSS relay)"

@@ -12,6 +12,8 @@ pub struct ConsolePrefs {
     pub theme: String,
     #[serde(default = "default_sidebar")]
     pub show_sidebar: bool,
+    #[serde(default)]
+    pub sidebar_width: Option<u16>,
 }
 
 fn default_theme() -> String {
@@ -27,6 +29,7 @@ impl Default for ConsolePrefs {
         Self {
             theme: default_theme(),
             show_sidebar: default_sidebar(),
+            sidebar_width: None,
         }
     }
 }
@@ -65,10 +68,12 @@ mod tests {
         let def = load(&dir);
         assert_eq!(def.theme, "ink");
         assert!(def.show_sidebar);
+        assert_eq!(def.sidebar_width, None);
 
         let updated = ConsolePrefs {
             theme: "tokyonight".into(),
             show_sidebar: false,
+            sidebar_width: Some(34),
         };
         save(&dir, &updated);
         assert_eq!(load(&dir), updated);

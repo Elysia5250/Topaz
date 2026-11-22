@@ -9,9 +9,16 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Envelope format version. Peers that speak different versions cannot share a
-/// session; devices upgrade together, so there is no in-band negotiation.
-pub const MUX_VERSION: u8 = 1;
+/// Session protocol version (v2: native QUIC multistream on direct links,
+/// Yamux per-stream flow control on relay links, 2-byte big-endian `service_id`
+/// stream prefix).
+pub const MUX_VERSION: u8 = 2;
+
+/// QUIC ALPN for direct device-to-device mTLS v2 sessions.
+pub const ALPN_DIRECT: &[u8] = b"topaz-v2";
+
+/// QUIC ALPN for coord UDP/QUIC datagram relay sessions.
+pub const ALPN_DGRAM_RELAY: &[u8] = b"topaz-dgram-relay-v1";
 
 /// Upper bound for one `Data` frame payload, so a bulk stream does not pin the
 /// writer for a full block.

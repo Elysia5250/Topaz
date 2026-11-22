@@ -1,27 +1,33 @@
 use crate::mux::{Channel, DynamicServices, Multiplexer, MuxRole, OnStream};
 use crate::quic::{QuicEndpoint, QuicLink};
-use crate::relay::{connect_relay, connect_relay_once, RelayAddrs, RelayTunnel};
+use crate::relay::{
+    connect_quic_datagram_relay, connect_relay, connect_relay_once, RelayAddrs, RelayStream,
+    RelayTunnel,
+};
 use crate::tls::TrustStore;
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use futures::future::select_ok;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
+use tokio_rustls::TlsStream;
 use topaz_core::DeviceIdentity;
 use topaz_proto::mux::service;
 use topaz_proto::SignalEnvelope;
-use futures::future::select_ok;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
-use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::sync::mpsc;
-use tokio_rustls::TlsStream;
 use tracing::{debug, info, warn};
 
 /// Receives inbound datagrams (raw packets) from a peer session.
 pub type OnDatagram = Arc<dyn Fn(Bytes) + Send + Sync>;
 
 const RELAY_DATAGRAM_QUEUE: usize = 256;
+/// Wire overhead for E2E-encrypted UDP/QUIC relay datagrams: 8-byte counter + 16-byte Poly1305 tag.
+const E2E_DGRAM_OVERHEAD: usize = 8 + 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionKind {
@@ -29,10 +35,121 @@ pub enum ConnectionKind {
     Relay,
 }
 
+struct QuicDgramRelayTx {
+    conn: quinn::Connection,
+    cipher: ChaCha20Poly1305,
+    seq: AtomicU64,
+}
+
+impl QuicDgramRelayTx {
+    fn send(&self, pkt: &[u8]) -> Result<()> {
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        let nonce = counter_nonce(seq);
+        let ct = self
+            .cipher
+            .encrypt(Nonce::from_slice(&nonce), pkt)
+            .map_err(|_| anyhow!("encrypt relay datagram failed"))?;
+        let mut frame = Vec::with_capacity(8 + ct.len());
+        frame.extend_from_slice(&seq.to_be_bytes());
+        frame.extend_from_slice(&ct);
+        self.conn
+            .send_datagram(Bytes::from(frame))
+            .map_err(|e| anyhow!("quic relay send datagram: {e}"))
+    }
+
+    fn max_payload(&self) -> Option<usize> {
+        self.conn
+            .max_datagram_size()
+            .map(|m| m.saturating_sub(E2E_DGRAM_OVERHEAD))
+    }
+}
+
+fn counter_nonce(seq: u64) -> [u8; 12] {
+    let mut n = [0u8; 12];
+    n[4..12].copy_from_slice(&seq.to_be_bytes());
+    n
+}
+
+/// 64-packet sliding anti-replay window for unreliable E2E-encrypted datagrams.
+struct ReplayWindow {
+    max_seq: u64,
+    seen_mask: u64,
+    initialized: bool,
+}
+
+impl ReplayWindow {
+    fn new() -> Self {
+        Self {
+            max_seq: 0,
+            seen_mask: 0,
+            initialized: false,
+        }
+    }
+
+    /// Returns `true` if `seq` is fresh and records it; `false` if duplicate or too old.
+    fn accept(&mut self, seq: u64) -> bool {
+        if !self.initialized {
+            self.initialized = true;
+            self.max_seq = seq;
+            self.seen_mask = 1;
+            return true;
+        }
+        if seq > self.max_seq {
+            let shift = seq - self.max_seq;
+            if shift >= 64 {
+                self.seen_mask = 1;
+            } else {
+                self.seen_mask = (self.seen_mask << shift) | 1;
+            }
+            self.max_seq = seq;
+            true
+        } else {
+            let diff = self.max_seq - seq;
+            if diff >= 64 {
+                return false;
+            }
+            let bit = 1u64 << diff;
+            if (self.seen_mask & bit) != 0 {
+                return false;
+            }
+            self.seen_mask |= bit;
+            true
+        }
+    }
+}
+
+fn decrypt_e2e_datagram(
+    cipher: &ChaCha20Poly1305,
+    window: &mut ReplayWindow,
+    frame: &[u8],
+) -> Option<Bytes> {
+    if frame.len() < E2E_DGRAM_OVERHEAD {
+        return None;
+    }
+    let seq = u64::from_be_bytes(frame[0..8].try_into().ok()?);
+    let nonce = counter_nonce(seq);
+    // Authenticate ciphertext BEFORE advancing the replay window so forged
+    // packets with large sequence numbers cannot shift the window.
+    let plain = cipher.decrypt(Nonce::from_slice(&nonce), &frame[8..]).ok()?;
+    if !window.accept(seq) {
+        return None;
+    }
+    Some(Bytes::from(plain))
+}
+
+#[derive(Clone)]
+struct RelayDatagramSender {
+    quic_fast: Arc<RwLock<Option<Arc<QuicDgramRelayTx>>>>,
+    fallback: mpsc::Sender<Bytes>,
+}
+
 /// Handle to send unreliable datagrams over an active peer session.
-/// On direct QUIC links, packets go through QUIC datagrams (RFC 9221) with no
-/// head-of-line blocking; on relay links, packets ride a dedicated `DATAGRAM`
-/// mux channel with tail-drop on congestion.
+///
+/// - On direct QUIC links, packets go through native QUIC datagrams (RFC 9221).
+/// - On relay links, packets prefer coord's UDP/QUIC unreliable datagram relay
+///   with E2E ChaCha20-Poly1305 encryption (no TCP-over-TCP congestion
+///   collapse), falling back transparently to a Yamux `DATAGRAM` stream if
+///   UDP 7724 is blocked or still connecting.
 #[derive(Clone)]
 pub struct DatagramSender {
     inner: DatagramKind,
@@ -41,7 +158,7 @@ pub struct DatagramSender {
 #[derive(Clone)]
 enum DatagramKind {
     Quic(quinn::Connection),
-    Relay(mpsc::Sender<Bytes>),
+    Relay(RelayDatagramSender),
 }
 
 impl DatagramSender {
@@ -50,16 +167,30 @@ impl DatagramSender {
             DatagramKind::Quic(conn) => conn
                 .send_datagram(pkt)
                 .map_err(|e| anyhow!("quic send datagram: {e}")),
-            DatagramKind::Relay(tx) => tx
-                .try_send(pkt)
-                .map_err(|e| anyhow!("relay send datagram: {e}")),
+            DatagramKind::Relay(r) => {
+                if let Some(fast) = r.quic_fast.read().unwrap().as_ref().cloned() {
+                    if fast.send(&pkt).is_ok() {
+                        return Ok(());
+                    }
+                }
+                r.fallback
+                    .try_send(pkt)
+                    .map_err(|e| anyhow!("relay send datagram: {e}"))
+            }
         }
     }
 
     pub fn max_size(&self) -> Option<usize> {
         match &self.inner {
             DatagramKind::Quic(conn) => conn.max_datagram_size(),
-            DatagramKind::Relay(_) => Some(topaz_proto::mux::MAX_DATA_CHUNK.saturating_sub(2)),
+            DatagramKind::Relay(r) => {
+                if let Some(fast) = r.quic_fast.read().unwrap().as_ref() {
+                    if let Some(sz) = fast.max_payload() {
+                        return Some(sz);
+                    }
+                }
+                Some(topaz_proto::mux::MAX_DATA_CHUNK.saturating_sub(2))
+            }
         }
     }
 }
@@ -70,21 +201,28 @@ pub struct PeerSession {
     pub datagram: DatagramSender,
 }
 
-enum Inner {
-    Quic(QuicLink),
-    Relay(Box<TlsStream<RelayTunnel>>),
+struct QuicRelayHint {
+    addr: String,
+    quic_tls: Arc<rustls::ClientConfig>,
+    identity: DeviceIdentity,
 }
 
-/// An authenticated, encrypted stream to another device of the same account.
+enum Inner {
+    Quic(QuicLink),
+    Relay {
+        stream: Box<TlsStream<RelayTunnel>>,
+        dgram_keys: [u8; 64],
+        quic_relay: Option<QuicRelayHint>,
+    },
+}
+
+/// An authenticated, encrypted link to another device of the same account.
 pub struct PeerLink {
     /// Device id proven by the peer's TLS certificate.
     pub peer_id: String,
     pub kind: ConnectionKind,
     /// On direct links: the device id of the QUIC client side (our own id
-    /// when we dialed, the peer's when we accepted). Two simultaneous punch
-    /// dials produce two live connections; keeping the one whose client has
-    /// the smaller id lets both sides converge on the same link. None on
-    /// relay links.
+    /// when we dialed, the peer's when we accepted).
     pub quic_client: Option<String>,
     inner: Inner,
 }
@@ -113,7 +251,38 @@ impl PeerLink {
             peer_id,
             kind: ConnectionKind::Relay,
             quic_client: None,
-            inner: Inner::Relay(Box::new(stream)),
+            inner: Inner::Relay {
+                stream: Box::new(stream),
+                dgram_keys: [0u8; 64],
+                quic_relay: None,
+            },
+        }
+    }
+
+    fn relay_with_quic(
+        relay_stream: RelayStream,
+        peer_id: String,
+        addrs: &RelayAddrs,
+        identity: &DeviceIdentity,
+    ) -> Self {
+        let quic_relay = if !addrs.quic.is_empty() {
+            addrs.coord_quic_tls.as_ref().map(|tls| QuicRelayHint {
+                addr: addrs.quic.clone(),
+                quic_tls: tls.clone(),
+                identity: identity.clone(),
+            })
+        } else {
+            None
+        };
+        Self {
+            peer_id,
+            kind: ConnectionKind::Relay,
+            quic_client: None,
+            inner: Inner::Relay {
+                stream: Box::new(relay_stream.tls),
+                dgram_keys: relay_stream.dgram_keys,
+                quic_relay,
+            },
         }
     }
 
@@ -124,12 +293,8 @@ impl PeerLink {
         services: &[u16],
         on_stream: OnStream,
     ) -> Multiplexer {
-        let role = if my_device_id < self.peer_id.as_str() {
-            MuxRole::Initiator
-        } else {
-            MuxRole::Acceptor
-        };
-        Multiplexer::start_on(self, role, services, on_stream)
+        self.into_session(my_device_id, services, on_stream, Arc::new(|_| {}))
+            .mux
     }
 
     /// Turn this link into a full [`PeerSession`] supporting both multiplexed
@@ -159,6 +324,7 @@ impl PeerLink {
         } else {
             MuxRole::Acceptor
         };
+        let peer_id = self.peer_id;
         let mut mux_services = services.to_vec();
         if !mux_services.contains(&service::DATAGRAM) {
             mux_services.push(service::DATAGRAM);
@@ -176,10 +342,9 @@ impl PeerLink {
         });
 
         match self.inner {
-            Inner::Quic(QuicLink { conn, stream }) => {
-                let mux = Multiplexer::start_on_with_dynamic(
-                    stream,
-                    role,
+            Inner::Quic(QuicLink { conn }) => {
+                let mux = Multiplexer::start_on_quic(
+                    conn.clone(),
                     &mux_services,
                     dynamic_services,
                     wrapped_on_stream,
@@ -198,12 +363,6 @@ impl PeerLink {
                         }
                     }
                 });
-                let conn_w = conn.clone();
-                let mux_w = mux.clone();
-                tokio::spawn(async move {
-                    mux_w.closed().await;
-                    conn_w.close(0u32.into(), b"session closed");
-                });
                 PeerSession {
                     mux,
                     datagram: DatagramSender {
@@ -211,7 +370,11 @@ impl PeerLink {
                     },
                 }
             }
-            Inner::Relay(stream) => {
+            Inner::Relay {
+                stream,
+                dgram_keys,
+                quic_relay,
+            } => {
                 let mux = Multiplexer::start_on_with_dynamic(
                     stream,
                     role,
@@ -253,10 +416,74 @@ impl PeerLink {
                         }
                     }
                 });
+
+                let quic_fast: Arc<RwLock<Option<Arc<QuicDgramRelayTx>>>> =
+                    Arc::new(RwLock::new(None));
+                if let Some(hint) = quic_relay {
+                    let (tx_key, rx_key) = match role {
+                        MuxRole::Initiator => (&dgram_keys[0..32], &dgram_keys[32..64]),
+                        MuxRole::Acceptor => (&dgram_keys[32..64], &dgram_keys[0..32]),
+                    };
+                    let tx_cipher = ChaCha20Poly1305::new(Key::from_slice(tx_key));
+                    let rx_cipher = ChaCha20Poly1305::new(Key::from_slice(rx_key));
+                    let fast_slot = quic_fast.clone();
+                    let mux_q = mux.clone();
+                    let on_dgram_q = on_datagram.clone();
+                    tokio::spawn(async move {
+                        let conn = tokio::select! {
+                            res = connect_quic_datagram_relay(
+                                &hint.addr,
+                                &hint.quic_tls,
+                                &hint.identity,
+                                &peer_id,
+                            ) => match res {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    debug!(peer = %peer_id, error = %e, "quic datagram relay unavailable; using yamux fallback");
+                                    return;
+                                }
+                            },
+                            _ = mux_q.closed() => return,
+                        };
+                        info!(peer = %peer_id, relay_quic = %hint.addr, "upgraded relay datagrams to UDP/QUIC");
+                        let sender = Arc::new(QuicDgramRelayTx {
+                            conn: conn.clone(),
+                            cipher: tx_cipher,
+                            seq: AtomicU64::new(0),
+                        });
+                        *fast_slot.write().unwrap() = Some(sender);
+
+                        let mut window = ReplayWindow::new();
+                        loop {
+                            tokio::select! {
+                                res = conn.read_datagram() => match res {
+                                    Ok(frame) => {
+                                        if let Some(plain) = decrypt_e2e_datagram(&rx_cipher, &mut window, &frame) {
+                                            on_dgram_q(plain);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        debug!(peer = %peer_id, error = %e, "quic datagram relay ended; falling back to yamux");
+                                        break;
+                                    }
+                                },
+                                _ = mux_q.closed() => {
+                                    conn.close(0u32.into(), b"session closed");
+                                    break;
+                                }
+                            }
+                        }
+                        *fast_slot.write().unwrap() = None;
+                    });
+                }
+
                 PeerSession {
                     mux,
                     datagram: DatagramSender {
-                        inner: DatagramKind::Relay(tx),
+                        inner: DatagramKind::Relay(RelayDatagramSender {
+                            quic_fast,
+                            fallback: tx,
+                        }),
                     },
                 }
             }
@@ -292,49 +519,6 @@ async fn read_dgram_channel(mut ch: Channel, on_datagram: OnDatagram) {
     }
 }
 
-impl AsyncRead for PeerLink {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        match &mut self.get_mut().inner {
-            Inner::Quic(q) => Pin::new(q).poll_read(cx, buf),
-            Inner::Relay(t) => Pin::new(t.as_mut()).poll_read(cx, buf),
-        }
-    }
-}
-
-impl AsyncWrite for PeerLink {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, std::io::Error>> {
-        match &mut self.get_mut().inner {
-            Inner::Quic(q) => Pin::new(q).poll_write(cx, buf),
-            Inner::Relay(t) => Pin::new(t.as_mut()).poll_write(cx, buf),
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
-        match &mut self.get_mut().inner {
-            Inner::Quic(q) => Pin::new(q).poll_flush(cx),
-            Inner::Relay(t) => Pin::new(t.as_mut()).poll_flush(cx),
-        }
-    }
-
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
-        match &mut self.get_mut().inner {
-            Inner::Quic(q) => Pin::new(q).poll_shutdown(cx),
-            Inner::Relay(t) => Pin::new(t.as_mut()).poll_shutdown(cx),
-        }
-    }
-}
-
 /// Join a relay session that `peer_id` asked for.
 pub async fn accept_relay(
     identity: &DeviceIdentity,
@@ -343,21 +527,19 @@ pub async fn accept_relay(
     peer_id: &str,
 ) -> Result<PeerLink> {
     let stream = connect_relay_once(relay, identity, trust, peer_id).await?;
-    Ok(PeerLink::relay(stream, peer_id.to_string()))
+    Ok(PeerLink::relay_with_quic(
+        stream,
+        peer_id.to_string(),
+        relay,
+        identity,
+    ))
 }
 
-/// How long each side keeps dialing the peer's candidates after the punch
-/// invitation. The first outbound datagram opens our NAT for the peer's
-/// return traffic; the peer's QUIC Initial retransmits then get through.
 const PUNCH_WINDOW: Duration = Duration::from_secs(8);
 const PUNCH_RETRY: Duration = Duration::from_millis(500);
 
 /// Try direct QUIC to the peer's endpoints in parallel, then fall back to the
-/// TCP relay. Before falling back, both sides are told to punch: we send our
-/// candidates to the peer over signaling, start dialing theirs in the
-/// background, and race the relay — first connection that completes wins, a
-/// later direct win upgrades over the relay session (the engine keeps
-/// exactly one connection per peer, direct preferred).
+/// TCP/WSS (+ optional UDP/QUIC datagram) relay.
 #[allow(clippy::too_many_arguments)]
 pub async fn connect_peer(
     identity: &DeviceIdentity,
@@ -373,7 +555,8 @@ pub async fn connect_peer(
 ) -> Result<PeerLink> {
     if force_relay {
         info!("force_relay enabled; skipping direct connect");
-    } else if let Some(link) = dial_direct(quic, peer_id, peer_endpoints, &identity.device_id).await {
+    } else if let Some(link) = dial_direct(quic, peer_id, peer_endpoints, &identity.device_id).await
+    {
         return Ok(link);
     }
 
@@ -399,7 +582,7 @@ pub async fn connect_peer(
         );
     }
 
-    info!(peer = %peer_id, relay = %relay.tcp, relay_ws = %relay.ws, "falling back to relay");
+    info!(peer = %peer_id, relay = %relay.tcp, relay_ws = %relay.ws, relay_quic = %relay.quic, "falling back to relay");
     signal_tx
         .send(SignalEnvelope {
             kind: "relay".into(),
@@ -413,13 +596,16 @@ pub async fn connect_peer(
     let stream = connect_relay(relay, identity, trust, peer_id)
         .await
         .map_err(|e| anyhow!("relay connect failed: {e}"))?;
-    Ok(PeerLink::relay(stream, peer_id.to_string()))
+    Ok(PeerLink::relay_with_quic(
+        stream,
+        peer_id.to_string(),
+        relay,
+        identity,
+    ))
 }
 
 /// Dial the peer's candidates for `PUNCH_WINDOW`, reporting the first direct
-/// link through `out`. The QUIC Initial retransmits are the hole-punching
-/// traffic; nothing else is needed on the dialing side. `done` runs when the
-/// window closes (win or timeout) so callers can drop their dedup marker.
+/// link through `out`.
 pub fn spawn_punch_window(
     quic: &QuicEndpoint,
     peer_id: &str,
@@ -508,9 +694,9 @@ async fn dial_direct(
 mod tests {
     use super::*;
     use crate::tls::{client_config, new_trust_store, server_config};
-    use topaz_proto::auth::parse_pubkey;
     use tokio::io::duplex;
     use tokio_rustls::{TlsAcceptor, TlsConnector};
+    use topaz_proto::auth::parse_pubkey;
 
     fn make_trusted_pair() -> (DeviceIdentity, DeviceIdentity, TrustStore, TrustStore) {
         let a = DeviceIdentity::generate().unwrap();
@@ -526,8 +712,50 @@ mod tests {
         (a, b, ta, tb)
     }
 
+    #[test]
+    fn e2e_datagram_encryption_and_replay_window() {
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&[7u8; 32]));
+        let mut win = ReplayWindow::new();
+
+        let seal_one = |seq: u64, msg: &[u8]| -> Vec<u8> {
+            let ct = cipher
+                .encrypt(Nonce::from_slice(&counter_nonce(seq)), msg)
+                .unwrap();
+            let mut out = Vec::with_capacity(8 + ct.len());
+            out.extend_from_slice(&seq.to_be_bytes());
+            out.extend_from_slice(&ct);
+            out
+        };
+
+        let f5 = seal_one(5, b"pkt5");
+        let f3 = seal_one(3, b"pkt3");
+        let f70 = seal_one(70, b"pkt70");
+        assert_eq!(
+            decrypt_e2e_datagram(&cipher, &mut win, &f5).unwrap(),
+            Bytes::from_static(b"pkt5")
+        );
+        // Replay rejected.
+        assert!(decrypt_e2e_datagram(&cipher, &mut win, &f5).is_none());
+        // Out-of-order within 64-packet window accepted.
+        assert_eq!(
+            decrypt_e2e_datagram(&cipher, &mut win, &f3).unwrap(),
+            Bytes::from_static(b"pkt3")
+        );
+        // Forged packet with huge seq must NOT poison the window.
+        let mut forged = seal_one(10_000, b"evil");
+        forged[12] ^= 0xff;
+        assert!(decrypt_e2e_datagram(&cipher, &mut win, &forged).is_none());
+        // Advance window past 64 packets -> seq 4 now too old.
+        assert_eq!(
+            decrypt_e2e_datagram(&cipher, &mut win, &f70).unwrap(),
+            Bytes::from_static(b"pkt70")
+        );
+        let f4 = seal_one(4, b"old");
+        assert!(decrypt_e2e_datagram(&cipher, &mut win, &f4).is_none());
+    }
+
     #[tokio::test]
-    async fn quic_session_streams_and_datagrams() {
+    async fn quic_session_streams_half_close_and_datagrams() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (a_id, b_id, ta, tb) = make_trusted_pair();
         let (ep_a, _) = QuicEndpoint::bind(&a_id, &ta, None).unwrap();
@@ -567,22 +795,39 @@ mod tests {
             }),
         );
 
-        // Stream roundtrip.
+        // Stream roundtrip with true half-close.
         let mut ch_a = sess_a.mux.open_channel(service::PING).await.unwrap();
         ch_a.write_all(b"ping").await.unwrap();
-        ch_a.flush().await.unwrap();
+        ch_a.shutdown().await.unwrap();
         let (svc, mut ch_b) = sb_rx.recv().await.unwrap();
         assert_eq!(svc, service::PING);
-        let mut buf = [0u8; 4];
-        ch_b.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, b"ping");
+        let mut req = Vec::new();
+        ch_b.read_to_end(&mut req).await.unwrap();
+        assert_eq!(&req, b"ping");
+        ch_b.write_all(b"pong").await.unwrap();
+        ch_b.shutdown().await.unwrap();
+        let mut resp = Vec::new();
+        ch_a.read_to_end(&mut resp).await.unwrap();
+        assert_eq!(&resp, b"pong");
 
         // Datagram roundtrip in both directions.
-        sess_a.datagram.send(Bytes::from_static(b"pkt-a-to-b")).unwrap();
-        assert_eq!(db_rx.recv().await.unwrap(), Bytes::from_static(b"pkt-a-to-b"));
+        sess_a
+            .datagram
+            .send(Bytes::from_static(b"pkt-a-to-b"))
+            .unwrap();
+        assert_eq!(
+            db_rx.recv().await.unwrap(),
+            Bytes::from_static(b"pkt-a-to-b")
+        );
 
-        sess_b.datagram.send(Bytes::from_static(b"pkt-b-to-a")).unwrap();
-        assert_eq!(da_rx.recv().await.unwrap(), Bytes::from_static(b"pkt-b-to-a"));
+        sess_b
+            .datagram
+            .send(Bytes::from_static(b"pkt-b-to-a"))
+            .unwrap();
+        assert_eq!(
+            da_rx.recv().await.unwrap(),
+            Bytes::from_static(b"pkt-b-to-a")
+        );
         assert!(sess_a.datagram.max_size().unwrap_or(0) >= 1200);
         drop(sa_rx.try_recv());
 
@@ -605,7 +850,9 @@ mod tests {
         let acceptor = TlsAcceptor::from(Arc::new(server_config(&b_id, &tb).unwrap()));
         let srv_name = rustls::pki_types::ServerName::try_from("topaz").unwrap();
         let (tls_a, tls_b) = tokio::try_join!(
-            async { Ok::<_, anyhow::Error>(TlsStream::Client(connector.connect(srv_name, tun_a).await?)) },
+            async {
+                Ok::<_, anyhow::Error>(TlsStream::Client(connector.connect(srv_name, tun_a).await?))
+            },
             async { Ok::<_, anyhow::Error>(TlsStream::Server(acceptor.accept(tun_b).await?)) },
         )
         .unwrap();
@@ -641,10 +888,21 @@ mod tests {
         ch_b.read_exact(&mut sbuf).await.unwrap();
         assert_eq!(&sbuf, b"hey");
 
-        sess_a.datagram.send(Bytes::from_static(b"relay-pkt-1")).unwrap();
-        assert_eq!(db_rx.recv().await.unwrap(), Bytes::from_static(b"relay-pkt-1"));
-        sess_b.datagram.send(Bytes::from_static(b"relay-pkt-2")).unwrap();
-        assert_eq!(da_rx.recv().await.unwrap(), Bytes::from_static(b"relay-pkt-2"));
+        sess_a
+            .datagram
+            .send(Bytes::from_static(b"relay-pkt-1"))
+            .unwrap();
+        assert_eq!(
+            db_rx.recv().await.unwrap(),
+            Bytes::from_static(b"relay-pkt-1")
+        );
+        sess_b
+            .datagram
+            .send(Bytes::from_static(b"relay-pkt-2"))
+            .unwrap();
+        assert_eq!(
+            da_rx.recv().await.unwrap(),
+            Bytes::from_static(b"relay-pkt-2")
+        );
     }
 }
-

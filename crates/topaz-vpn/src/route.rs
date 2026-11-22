@@ -139,6 +139,62 @@ pub fn parse_ipv4_endpoints(pkt: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr, usize)> {
     Some((src, dst, total_len))
 }
 
+fn internet_checksum(data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut chunks = data.chunks_exact(2);
+    for pair in &mut chunks {
+        sum += u16::from_be_bytes([pair[0], pair[1]]) as u32;
+    }
+    if let Some(&last) = chunks.remainder().first() {
+        sum += (last as u32) << 8;
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Build an RFC 792 / RFC 1191 ICMPv4 Type 3 Code 4 ("Fragmentation Needed and
+/// DF Set") packet to inject back into the local TUN interface when an
+/// outbound IPv4 packet exceeds the peer's current QUIC `max_datagram_size`.
+pub fn build_icmp_frag_needed(orig_pkt: &[u8], next_hop_mtu: u16) -> Option<Vec<u8>> {
+    let (orig_src, orig_dst, total_len) = parse_ipv4_endpoints(orig_pkt)?;
+    // Never reply with ICMP errors to ICMP packets (prevents error loops).
+    if orig_pkt[9] == 1 {
+        return None;
+    }
+    let ihl = ((orig_pkt[0] & 0x0f) as usize) * 4;
+    let quote_len = (ihl + 8).min(total_len).min(orig_pkt.len());
+    let icmp_len = 8 + quote_len;
+    let ip_total_len = (20 + icmp_len) as u16;
+
+    let mut out = vec![0u8; ip_total_len as usize];
+    // IPv4 header (20 bytes)
+    out[0] = 0x45; // v4, IHL=5
+    out[1] = 0;
+    out[2..4].copy_from_slice(&ip_total_len.to_be_bytes());
+    out[4..6].copy_from_slice(&0u16.to_be_bytes()); // Identification
+    out[6..8].copy_from_slice(&0u16.to_be_bytes()); // Flags/Frag offset
+    out[8] = 64; // TTL
+    out[9] = 1; // Protocol = ICMP
+    out[12..16].copy_from_slice(&orig_dst.octets());
+    out[16..20].copy_from_slice(&orig_src.octets());
+    let ip_cksum = internet_checksum(&out[0..20]);
+    out[10..12].copy_from_slice(&ip_cksum.to_be_bytes());
+
+    // ICMP Type 3 (Destination Unreachable), Code 4 (Fragmentation Needed)
+    out[20] = 3;
+    out[21] = 4;
+    // out[22..24] checksum (filled below)
+    // out[24..26] unused (0)
+    out[26..28].copy_from_slice(&next_hop_mtu.to_be_bytes());
+    out[28..28 + quote_len].copy_from_slice(&orig_pkt[..quote_len]);
+    let icmp_cksum = internet_checksum(&out[20..]);
+    out[22..24].copy_from_slice(&icmp_cksum.to_be_bytes());
+
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,5 +305,27 @@ mod tests {
             Some(Ipv4Addr::new(100, 64, 0, 3))
         );
         assert_eq!(tbl.resolve_dns("missing.topaz"), None);
+    }
+
+    #[test]
+    fn builds_valid_icmp_frag_needed_for_oversized_packet() {
+        let mut orig = mk_ipv4([100, 64, 0, 1], [100, 64, 0, 2], 24);
+        orig[9] = 6; // TCP
+        orig[20..28].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let icmp = build_icmp_frag_needed(&orig, 1200).unwrap();
+        assert_eq!(icmp.len(), 20 + 8 + 20 + 8);
+        assert_eq!(internet_checksum(&icmp[0..20]), 0);
+        assert_eq!(internet_checksum(&icmp[20..]), 0);
+        assert_eq!(icmp[9], 1); // ICMP
+        assert_eq!(&icmp[12..16], &[100, 64, 0, 2]); // swapped src
+        assert_eq!(&icmp[16..20], &[100, 64, 0, 1]); // swapped dst
+        assert_eq!(icmp[20], 3); // Dest Unreachable
+        assert_eq!(icmp[21], 4); // Frag Needed
+        assert_eq!(u16::from_be_bytes([icmp[26], icmp[27]]), 1200);
+        assert_eq!(&icmp[28..56], &orig[0..28]);
+
+        // Must never generate ICMP errors in response to ICMP packets.
+        orig[9] = 1;
+        assert!(build_icmp_frag_needed(&orig, 1200).is_none());
     }
 }

@@ -1,4 +1,4 @@
-use crate::tls::pinned_client_config;
+use crate::tls::{pinned_client_config, pinned_quic_client_config};
 use anyhow::{anyhow, bail, Context, Result};
 use futures::{SinkExt, StreamExt};
 use rand::RngCore;
@@ -6,6 +6,7 @@ use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use topaz_core::{now_unix, DeviceIdentity};
 use topaz_proto::auth::{
     parse_pin, request_signing_bytes, DeviceEntry, Revocation, HDR_DEVICE, HDR_NONCE, HDR_SIG,
@@ -13,12 +14,56 @@ use topaz_proto::auth::{
 };
 use topaz_proto::{
     CreateAccountRequest, DeviceCert, EnrollFinish, EnrollReply, EnrollStart, EnrollStarted,
-    PeerEndpoints, RegisterRequest, RegisterResponse, SignalEnvelope,
+    PeerEndpoints, RegisterRequest, RegisterResponse, ServerInfo, ServerVersion, SignalEnvelope,
+    HDR_ENROLL_TOKEN,
 };
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::Message, Connector};
+use tracing::{info, warn};
+
+const SIGNAL_PING_EVERY: Duration = Duration::from_secs(30);
+const SIGNAL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Structured error returned by [`CoordClient`] HTTP calls so callers can
+/// distinguish permanent device revocation from transient clock skew or
+/// transport outages without string-matching `"401"`.
+#[derive(Debug, thiserror::Error)]
+pub enum CoordError {
+    #[error("device revoked or unknown on coord: {0}")]
+    DeviceRevoked(String),
+    #[error("request rejected due to clock skew or nonce replay: {0}")]
+    ClockSkewOrReplay(String),
+    #[error("unauthorized coord request: {0}")]
+    Unauthorized(String),
+    #[error("{method} {path} failed: {status} {body}")]
+    Http {
+        method: String,
+        path: String,
+        status: u16,
+        body: String,
+    },
+}
+
+fn classify_http_error(method: &Method, path: &str, status: StatusCode, body: String) -> CoordError {
+    if status == StatusCode::UNAUTHORIZED {
+        let lower = body.to_ascii_lowercase();
+        if lower.contains("unknown or revoked device") {
+            return CoordError::DeviceRevoked(body);
+        }
+        if lower.contains("stale or replayed") || lower.contains("bad timestamp") {
+            return CoordError::ClockSkewOrReplay(body);
+        }
+        return CoordError::Unauthorized(body);
+    }
+    CoordError::Http {
+        method: method.to_string(),
+        path: path.to_string(),
+        status: status.as_u16(),
+        body,
+    }
+}
 
 /// Client for the coordination server. Requests that act on an account are
 /// signed with the device key; account creation, device certificates and
@@ -28,6 +73,7 @@ pub struct CoordClient {
     base: String,
     http: reqwest::Client,
     tls: Arc<rustls::ClientConfig>,
+    quic_tls: Arc<rustls::ClientConfig>,
     identity: Option<DeviceIdentity>,
 }
 
@@ -59,6 +105,7 @@ impl CoordClient {
         }
         let pin = parse_pin(pin).ok_or_else(|| anyhow!("coord pin is missing or malformed"))?;
         let tls = Arc::new(pinned_client_config(pin)?);
+        let quic_tls = Arc::new(pinned_quic_client_config(pin)?);
         let http = reqwest::Client::builder()
             .use_preconfigured_tls((*tls).clone())
             .connect_timeout(std::time::Duration::from_secs(10))
@@ -68,6 +115,7 @@ impl CoordClient {
             base,
             http,
             tls,
+            quic_tls,
             identity: None,
         })
     }
@@ -82,6 +130,18 @@ impl CoordClient {
             .await?
             .ok_or_else(|| anyhow!("GET /healthz failed: 404 not found"))?;
         Ok(())
+    }
+
+    pub async fn server_version(&self) -> Result<ServerVersion> {
+        self.json(Method::GET, "/v1/version", None::<&()>, false)
+            .await?
+            .ok_or_else(|| anyhow!("GET /v1/version failed: 404 not found"))
+    }
+
+    pub async fn server_info(&self) -> Result<ServerInfo> {
+        self.json(Method::GET, "/v1/info", None::<&()>, false)
+            .await?
+            .ok_or_else(|| anyhow!("GET /v1/info failed: 404 not found"))
     }
 
     async fn call(
@@ -117,7 +177,7 @@ impl CoordClient {
         if !res.status().is_success() {
             let status = res.status();
             let text = res.text().await.unwrap_or_default();
-            return Err(anyhow!("{method} {path} failed: {status} {text}"));
+            return Err(classify_http_error(&method, path, status, text).into());
         }
         Ok(Some(res))
     }
@@ -254,20 +314,45 @@ impl CoordClient {
         .await
     }
 
-    pub async fn enroll_get_finish(&self, nameplate: &str) -> Result<Option<String>> {
-        let finish: Option<EnrollFinish> = self
-            .json(
-                Method::GET,
-                &format!("/v1/enroll/{nameplate}/finish"),
-                None::<&()>,
-                false,
-            )
-            .await?;
-        Ok(finish.map(|f| f.payload))
+    pub async fn enroll_get_finish(
+        &self,
+        nameplate: &str,
+        finish_token: &str,
+    ) -> Result<Option<String>> {
+        let path = format!("/v1/enroll/{nameplate}/finish");
+        let res = self
+            .http
+            .request(Method::GET, format!("{}{path}", self.base))
+            .header(HDR_ENROLL_TOKEN, finish_token)
+            .send()
+            .await
+            .with_context(|| format!("GET {path}"))?;
+        if res.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !res.status().is_success() {
+            let status = res.status();
+            let text = res.text().await.unwrap_or_default();
+            return Err(anyhow!("GET {path} failed: {status} {text}"));
+        }
+        let finish: EnrollFinish = res.json().await?;
+        Ok(Some(finish.payload))
     }
 
     pub fn tls_config(&self) -> Arc<rustls::ClientConfig> {
         self.tls.clone()
+    }
+
+    pub fn quic_tls_config(&self) -> Arc<rustls::ClientConfig> {
+        self.quic_tls.clone()
+    }
+
+    pub fn relay_quic_addr(&self, register: &RegisterResponse) -> String {
+        register
+            .relay_quic
+            .strip_prefix("quic://")
+            .unwrap_or(&register.relay_quic)
+            .to_string()
     }
 
     pub fn relay_addr(&self, register: &RegisterResponse) -> String {
@@ -292,7 +377,12 @@ impl CoordClient {
     /// Upgrade-only probe of the WebSocket relay path (no relay hello).
     pub async fn probe_relay_ws(&self) -> Result<()> {
         let url = self.websocket_relay_url();
-        let request = url.as_str().into_client_request()?;
+        self.probe_relay_ws_url(&url).await
+    }
+
+    /// Upgrade-only probe of a specific WebSocket relay URL (no relay hello).
+    pub async fn probe_relay_ws_url(&self, url: &str) -> Result<()> {
+        let request = url.into_client_request()?;
         let (mut ws, _) = tokio::time::timeout(
             std::time::Duration::from_secs(3),
             connect_async_tls_with_config(
@@ -309,11 +399,58 @@ impl CoordClient {
         Ok(())
     }
 
-    /// Open the signaling websocket. Returns a sender for outgoing envelopes
-    /// and a receiver for incoming ones.
-    pub async fn signal(
+    /// Handshake-only probe of the coord's UDP/QUIC datagram relay (`addr` as `host:port`).
+    pub async fn probe_relay_quic(&self, addr: &str) -> Result<()> {
+        let target = addr.trim().strip_prefix("quic://").unwrap_or(addr.trim()).to_string();
+        if target.is_empty() {
+            bail!("quic datagram relay is disabled");
+        }
+        let remote = tokio::task::spawn_blocking(move || -> Result<std::net::SocketAddr> {
+            use std::net::ToSocketAddrs;
+            let mut addrs = target
+                .to_socket_addrs()
+                .with_context(|| format!("resolve {target}"))?;
+            addrs
+                .next()
+                .ok_or_else(|| anyhow!("{target} resolved to no addresses"))
+        })
+        .await??;
+
+        let quic_crypto =
+            quinn::crypto::rustls::QuicClientConfig::try_from((*self.quic_tls).clone())?;
+        let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_crypto));
+        let mut transport = quinn::TransportConfig::default();
+        transport.initial_mtu(1350);
+        transport.max_idle_timeout(Some(Duration::from_secs(5).try_into()?));
+        client_cfg.transport_config(Arc::new(transport));
+
+        let bind_addr: std::net::SocketAddr = if remote.is_ipv6() {
+            "[::]:0".parse()?
+        } else {
+            "0.0.0.0:0".parse()?
+        };
+        let mut endpoint = quinn::Endpoint::client(bind_addr)?;
+        endpoint.set_default_client_config(client_cfg);
+
+        let conn = tokio::time::timeout(
+            Duration::from_secs(3),
+            endpoint.connect(remote, "topaz-coord")?,
+        )
+        .await
+        .map_err(|_| anyhow!("quic datagram relay timed out"))??;
+        conn.close(0u32.into(), b"doctor");
+        endpoint.close(0u32.into(), b"doctor");
+        Ok(())
+    }
+
+    /// Open a single signaling websocket connection with ping/pong keepalive.
+    async fn connect_signal_ws(
         &self,
-    ) -> Result<(mpsc::Sender<SignalEnvelope>, mpsc::Receiver<SignalEnvelope>)> {
+    ) -> Result<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    > {
         let identity = self
             .identity
             .as_ref()
@@ -324,45 +461,165 @@ impl CoordClient {
             request.headers_mut().insert(k, HeaderValue::from_str(&v)?);
         }
 
-        let (ws, _) = connect_async_tls_with_config(
-            request,
-            None,
-            false,
-            Some(Connector::Rustls(self.tls.clone())),
+        let (ws, _) = tokio::time::timeout(
+            Duration::from_secs(10),
+            connect_async_tls_with_config(
+                request,
+                None,
+                false,
+                Some(Connector::Rustls(self.tls.clone())),
+            ),
         )
         .await
+        .map_err(|_| anyhow!("signal websocket connect timed out"))?
         .context("signal websocket")?;
-        let (mut sink, mut stream) = ws.split();
+        Ok(ws)
+    }
+
+    /// Open a single signaling websocket (non-reconnecting).
+    pub async fn signal(
+        &self,
+    ) -> Result<(mpsc::Sender<SignalEnvelope>, mpsc::Receiver<SignalEnvelope>)> {
+        let ws = self.connect_signal_ws().await?;
         let (tx_out, mut rx_out) = mpsc::channel::<SignalEnvelope>(32);
         let (tx_in, rx_in) = mpsc::channel::<SignalEnvelope>(32);
-
         tokio::spawn(async move {
-            while let Some(env) = rx_out.recv().await {
-                let Ok(text) = serde_json::to_string(&env) else {
-                    continue;
-                };
-                if sink.send(Message::Text(text.into())).await.is_err() {
+            let _ = drive_signal_ws(ws, &mut rx_out, &tx_in).await;
+        });
+        Ok((tx_out, rx_in))
+    }
+
+    /// Spawn a persistent, self-healing signaling websocket supervisor.
+    ///
+    /// The returned `(tx, rx)` channels stay open across coord restarts, NAT
+    /// idle drops, and temporary network outages. `on_connected` is invoked
+    /// whenever a signaling session connects (including reconnects).
+    pub fn spawn_signal_supervisor(
+        &self,
+        on_connected: Arc<dyn Fn() + Send + Sync>,
+    ) -> (mpsc::Sender<SignalEnvelope>, mpsc::Receiver<SignalEnvelope>) {
+        let (tx_out, mut rx_out) = mpsc::channel::<SignalEnvelope>(64);
+        let (tx_in, rx_in) = mpsc::channel::<SignalEnvelope>(64);
+        let client = self.clone();
+        tokio::spawn(async move {
+            let mut backoff = Duration::from_secs(1);
+            let mut first = true;
+            loop {
+                if tx_in.is_closed() {
                     break;
                 }
-            }
-        });
-
-        tokio::spawn(async move {
-            while let Some(Ok(msg)) = stream.next().await {
-                let text = match msg {
-                    Message::Text(t) => t.to_string(),
-                    Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
-                    Message::Close(_) => break,
-                    _ => continue,
-                };
-                if let Ok(env) = serde_json::from_str::<SignalEnvelope>(&text) {
-                    if tx_in.send(env).await.is_err() {
-                        break;
+                match client.connect_signal_ws().await {
+                    Ok(ws) => {
+                        let connected_at = Instant::now();
+                        if first {
+                            info!("signaling websocket connected");
+                            first = false;
+                        } else {
+                            info!("signaling websocket reconnected");
+                        }
+                        on_connected();
+                        let should_stop = drive_signal_ws(ws, &mut rx_out, &tx_in).await;
+                        if should_stop || tx_in.is_closed() {
+                            break;
+                        }
+                        if connected_at.elapsed() >= Duration::from_secs(10) {
+                            backoff = Duration::from_secs(1);
+                        }
+                        warn!(retry_in = ?backoff, "signaling websocket disconnected; reconnecting");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, retry_in = ?backoff, "signaling websocket connect failed; retrying");
                     }
                 }
+                // Drain stale queued outbound signals while offline so we don't
+                // burst outdated punch/relay envelopes on reconnect.
+                while rx_out.try_recv().is_ok() {}
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    _ = tx_in.closed() => break,
+                }
+                backoff = (backoff * 2).min(Duration::from_secs(30));
             }
         });
+        (tx_out, rx_in)
+    }
+}
 
-        Ok((tx_out, rx_in))
+/// Drive one live signaling WebSocket with bidirectional Ping/Pong keepalive
+/// and idle timeout. Returns `true` if local callers closed the channels.
+async fn drive_signal_ws<S>(
+    ws: tokio_tungstenite::WebSocketStream<S>,
+    rx_out: &mut mpsc::Receiver<SignalEnvelope>,
+    tx_in: &mpsc::Sender<SignalEnvelope>,
+) -> bool
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut sink, mut stream) = ws.split();
+    let mut ping = tokio::time::interval(SIGNAL_PING_EVERY);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ping.tick().await;
+    let mut last_seen = Instant::now();
+
+    loop {
+        let idle_deadline = tokio::time::Instant::from_std(last_seen + SIGNAL_IDLE_TIMEOUT);
+        tokio::select! {
+            out = rx_out.recv() => match out {
+                Some(env) => {
+                    let Ok(text) = serde_json::to_string(&env) else {
+                        continue;
+                    };
+                    if sink.send(Message::Text(text.into())).await.is_err() {
+                        return false;
+                    }
+                }
+                None => {
+                    let _ = sink.send(Message::Close(None)).await;
+                    return true;
+                }
+            },
+            incoming = stream.next() => match incoming {
+                Some(Ok(Message::Text(t))) => {
+                    last_seen = Instant::now();
+                    if let Ok(env) = serde_json::from_str::<SignalEnvelope>(&t) {
+                        if tx_in.send(env).await.is_err() {
+                            return true;
+                        }
+                    }
+                }
+                Some(Ok(Message::Binary(b))) => {
+                    last_seen = Instant::now();
+                    let text = String::from_utf8_lossy(&b);
+                    if let Ok(env) = serde_json::from_str::<SignalEnvelope>(&text) {
+                        if tx_in.send(env).await.is_err() {
+                            return true;
+                        }
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => {
+                    last_seen = Instant::now();
+                    if sink.send(Message::Pong(p)).await.is_err() {
+                        return false;
+                    }
+                }
+                Some(Ok(Message::Pong(_))) => {
+                    last_seen = Instant::now();
+                }
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return false,
+                Some(Ok(Message::Frame(_))) => {
+                    last_seen = Instant::now();
+                }
+            },
+            _ = ping.tick() => {
+                if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    return false;
+                }
+            },
+            _ = tokio::time::sleep_until(idle_deadline) => {
+                warn!("signaling websocket idle timeout; dropping connection");
+                let _ = sink.send(Message::Close(None)).await;
+                return false;
+            }
+        }
     }
 }

@@ -78,31 +78,23 @@ impl DeviceIdentity {
     }
 }
 
-/// Write a file readable only by the current user where the OS supports it.
+/// Atomically write a private file (`0o600`, no symlink following) readable
+/// only by the current/sudo user where the OS supports it.
 pub fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .with_context(|| format!("open {}", path.display()))?;
-        f.write_all(contents)
-            .with_context(|| format!("write {}", path.display()))?;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-        crate::store::chown_to_sudo_user(path);
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, contents).with_context(|| format!("write {}", path.display()))?;
-    }
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("private");
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_file_name(format!(".{file_name}.{}.{seq}.tmp", std::process::id()));
+    crate::store::write_new_file(&tmp, contents, 0o600)?;
+    std::fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
     Ok(())
 }
 

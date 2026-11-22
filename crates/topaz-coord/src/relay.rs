@@ -2,7 +2,8 @@ use crate::state::{now_unix, utc_day, AppState};
 use anyhow::{bail, Result};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, Extension};
-use axum::response::Response;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use futures::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -24,6 +25,10 @@ use tracing::{info, warn};
 const PENDING_TTL: Duration = Duration::from_secs(45);
 const USAGE_FLUSH: Duration = Duration::from_secs(60);
 const WS_FRAME: usize = 16 * 1024;
+/// Maximum concurrent TCP relay connections (pending + active) to prevent FD/memory DoS.
+const MAX_TCP_RELAY_CONNS: usize = 2048;
+/// Maximum concurrent UDP/QUIC datagram relay connections.
+const MAX_QUIC_RELAY_CONNS: usize = 2048;
 
 /// Byte sent to both halves when the session starts.
 const READY: u8 = 1;
@@ -154,6 +159,16 @@ struct Pending {
     user_id: String,
     since: Instant,
     stream: RelayConn,
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+struct PendingDgram {
+    device_id: String,
+    user_id: String,
+    since: Instant,
+    conn: quinn::Connection,
+    ctrl_send: quinn::SendStream,
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 struct ActiveSession {
@@ -166,6 +181,7 @@ struct Relay {
     state: Arc<AppState>,
     limits: Limits,
     pending: Mutex<HashMap<String, Pending>>,
+    dgram_pending: Mutex<HashMap<String, PendingDgram>>,
     accounts: std::sync::Mutex<HashMap<String, Arc<AccountRelay>>>,
     active: std::sync::Mutex<HashMap<u64, ActiveSession>>,
     next_session_id: AtomicU64,
@@ -221,6 +237,7 @@ impl RelayHandle {
             state,
             limits,
             pending: Mutex::new(HashMap::new()),
+            dgram_pending: Mutex::new(HashMap::new()),
             accounts: std::sync::Mutex::new(HashMap::new()),
             active: std::sync::Mutex::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
@@ -247,6 +264,17 @@ impl RelayHandle {
             let mut pending = self.0.pending.lock().await;
             pending.retain(|_, p| p.device_id != device_id);
         }
+        {
+            let mut dgram_pending = self.0.dgram_pending.lock().await;
+            dgram_pending.retain(|_, p| {
+                if p.device_id == device_id {
+                    p.conn.close(1u32.into(), b"revoked");
+                    false
+                } else {
+                    true
+                }
+            });
+        }
         let cancels: Vec<tokio::sync::oneshot::Sender<()>> = {
             let mut active = self.0.active.lock().unwrap();
             let ids: Vec<u64> = active
@@ -272,11 +300,16 @@ impl RelayHandle {
             "relay listening"
         );
         let relay = self.0.clone();
+        let tcp_sem = Arc::new(tokio::sync::Semaphore::new(MAX_TCP_RELAY_CONNS));
         tokio::spawn(async move {
             loop {
+                let Ok(permit) = tcp_sem.clone().acquire_owned().await else {
+                    break;
+                };
                 let (stream, peer) = match listener.accept().await {
                     Ok(c) => c,
                     Err(e) => {
+                        drop(permit);
                         warn!(error = %e, "relay accept failed");
                         tokio::time::sleep(Duration::from_millis(200)).await;
                         continue;
@@ -284,13 +317,50 @@ impl RelayHandle {
                 };
                 let relay = relay.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_tcp(stream, peer, relay).await {
+                    if let Err(e) = handle_tcp(stream, peer, relay, Some(permit)).await {
                         warn!(error = %e, %peer, "relay connection rejected");
                     }
                 });
             }
         });
         Ok(())
+    }
+
+    /// Listen for UDP/QUIC unreliable datagram relay sessions on `addr`.
+    /// Forwarded datagrams are opaque E2E-encrypted payloads (zero TCP-over-TCP).
+    pub async fn listen_quic_datagram(
+        &self,
+        addr: SocketAddr,
+        server_cfg: quinn::ServerConfig,
+    ) -> Result<SocketAddr> {
+        let endpoint = quinn::Endpoint::server(server_cfg, addr)?;
+        let bound = endpoint.local_addr()?;
+        info!(%bound, "quic datagram relay listening");
+        let relay = self.0.clone();
+        let sem = Arc::new(tokio::sync::Semaphore::new(MAX_QUIC_RELAY_CONNS));
+        tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                let Ok(permit) = sem.clone().try_acquire_owned() else {
+                    incoming.refuse();
+                    continue;
+                };
+                let relay = relay.clone();
+                tokio::spawn(async move {
+                    match incoming.await {
+                        Ok(conn) => {
+                            let peer = conn.remote_address();
+                            if let Err(e) = handle_quic_dgram(conn, peer, relay, Some(permit)).await {
+                                warn!(error = %e, %peer, "quic datagram relay rejected");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "quic datagram relay handshake failed");
+                        }
+                    }
+                });
+            }
+        });
+        Ok(bound)
     }
 }
 
@@ -306,8 +376,11 @@ pub async fn ws_upgrade(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     ws: WebSocketUpgrade,
 ) -> Response {
+    let Ok(permit) = relay.0.state.ws_semaphore.clone().try_acquire_owned() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "too many websocket connections").into_response();
+    };
     ws.on_upgrade(move |socket| async move {
-        if let Err(e) = handle_ws(socket, addr, relay).await {
+        if let Err(e) = handle_ws(socket, addr, relay, Some(permit)).await {
             warn!(error = %e, %addr, "relay websocket rejected");
         }
     })
@@ -321,7 +394,7 @@ fn session_key(a: &str, b: &str) -> String {
     }
 }
 
-async fn read_hello(stream: &mut RelayConn) -> Result<RelayHello> {
+async fn read_hello_from<R: AsyncRead + Unpin>(stream: &mut R) -> Result<RelayHello> {
     tokio::time::timeout(Duration::from_secs(10), async {
         let mut len_buf = [0u8; 4];
         stream.read_exact(&mut len_buf).await?;
@@ -336,6 +409,10 @@ async fn read_hello(stream: &mut RelayConn) -> Result<RelayHello> {
     .await?
 }
 
+async fn read_hello(stream: &mut RelayConn) -> Result<RelayHello> {
+    read_hello_from(stream).await
+}
+
 /// Both ends must be active devices of the same account. Returns the account.
 fn authorize(state: &AppState, hello: &RelayHello) -> Result<String> {
     let Some(me) = state.active_device(&hello.device_id) else {
@@ -345,7 +422,7 @@ fn authorize(state: &AppState, hello: &RelayHello) -> Result<String> {
     if !verify(&me.pubkey, &msg, &hello.sig) {
         bail!("bad relay signature from {}", hello.device_id);
     }
-    if !state.fresh(hello.time, &hello.nonce) {
+    if !state.fresh(&hello.device_id, hello.time, &hello.nonce) {
         bail!("stale or replayed relay hello");
     }
     match state.active_device(&hello.peer_id) {
@@ -368,10 +445,11 @@ fn enable_tcp_keepalive(stream: &TcpStream) {
 }
 
 /// True unless the peer has closed or the socket is already in error.
-/// A waiting client that timed out sends FIN; `try_read` then returns 0.
+/// Uses `MSG_PEEK` via `socket2::SockRef::peek` so any buffered bytes are
+/// never consumed or discarded.
 fn socket_alive(stream: &TcpStream) -> bool {
-    let mut buf = [0u8; 1];
-    match stream.try_read(&mut buf) {
+    let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 1];
+    match socket2::SockRef::from(stream).peek(&mut buf) {
         Ok(0) => false,
         Ok(_) => true,
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
@@ -508,19 +586,39 @@ fn bridge_axum_ws(ws: WebSocket) -> RelayConn {
     })
 }
 
-async fn handle_tcp(stream: TcpStream, peer: SocketAddr, relay: Arc<Relay>) -> Result<()> {
+async fn handle_tcp(
+    stream: TcpStream,
+    peer: SocketAddr,
+    relay: Arc<Relay>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> Result<()> {
     let _ = stream.set_nodelay(true);
     enable_tcp_keepalive(&stream);
-    handle_conn(RelayConn::Tcp(stream), peer, relay).await
+    handle_conn(RelayConn::Tcp(stream), peer, relay, permit).await
 }
 
-async fn handle_ws(socket: WebSocket, peer: SocketAddr, relay: RelayHandle) -> Result<()> {
-    handle_conn(bridge_axum_ws(socket), peer, relay.0).await
+async fn handle_ws(
+    socket: WebSocket,
+    peer: SocketAddr,
+    relay: RelayHandle,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> Result<()> {
+    handle_conn(bridge_axum_ws(socket), peer, relay.0, permit).await
 }
 
-async fn handle_conn(mut stream: RelayConn, peer_addr: SocketAddr, relay: Arc<Relay>) -> Result<()> {
+async fn handle_conn(
+    mut stream: RelayConn,
+    peer_addr: SocketAddr,
+    relay: Arc<Relay>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> Result<()> {
     let hello = read_hello(&mut stream).await?;
-    let user_id = match authorize(&relay.state, &hello) {
+    let state_for_auth = relay.state.clone();
+    let hello_for_auth = hello.clone();
+    let auth_res = tokio::task::spawn_blocking(move || authorize(&state_for_auth, &hello_for_auth))
+        .await
+        .map_err(|e| anyhow::anyhow!("auth task failed: {e}"))?;
+    let user_id = match auth_res {
         Ok(u) => u,
         Err(e) => {
             let _ = stream.write_all(&[REJECTED]).await;
@@ -534,6 +632,7 @@ async fn handle_conn(mut stream: RelayConn, peer_addr: SocketAddr, relay: Arc<Re
         user_id: user_id.clone(),
         since: Instant::now(),
         stream,
+        _permit: permit,
     };
 
     let mut map = relay.pending.lock().await;
@@ -586,7 +685,10 @@ async fn handle_conn(mut stream: RelayConn, peer_addr: SocketAddr, relay: Arc<Re
         },
     );
     let relay_for_task = relay.clone();
+    let _mine_permit = mine._permit;
+    let _other_permit = other._permit;
     tokio::spawn(async move {
+        let (_p1, _p2) = (_mine_permit, _other_permit);
         let pump = async {
             match (mine.stream, other.stream) {
                 (RelayConn::Tcp(a), RelayConn::Tcp(b)) => {
@@ -617,6 +719,141 @@ async fn handle_conn(mut stream: RelayConn, peer_addr: SocketAddr, relay: Arc<Re
         acct.sessions.fetch_sub(1, Ordering::AcqRel);
     });
     Ok(())
+}
+
+async fn handle_quic_dgram(
+    conn: quinn::Connection,
+    peer_addr: SocketAddr,
+    relay: Arc<Relay>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> Result<()> {
+    let (mut ctrl_send, mut ctrl_recv) =
+        tokio::time::timeout(Duration::from_secs(10), conn.accept_bi())
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for quic relay hello stream"))??;
+    let hello = read_hello_from(&mut ctrl_recv).await?;
+    let state_for_auth = relay.state.clone();
+    let hello_for_auth = hello.clone();
+    let auth_res = tokio::task::spawn_blocking(move || authorize(&state_for_auth, &hello_for_auth))
+        .await
+        .map_err(|e| anyhow::anyhow!("auth task failed: {e}"))?;
+    let user_id = match auth_res {
+        Ok(u) => u,
+        Err(e) => {
+            let _ = ctrl_send.write_all(&[REJECTED]).await;
+            let _ = ctrl_send.finish();
+            conn.close(1u32.into(), b"rejected");
+            return Err(e);
+        }
+    };
+
+    let key = session_key(&hello.device_id, &hello.peer_id);
+    let mut mine = PendingDgram {
+        device_id: hello.device_id,
+        user_id: user_id.clone(),
+        since: Instant::now(),
+        conn,
+        ctrl_send,
+        _permit: permit,
+    };
+
+    let mut map = relay.dgram_pending.lock().await;
+    map.retain(|_, p| p.since.elapsed() < PENDING_TTL && p.conn.close_reason().is_none());
+    let partner = match map.remove(&key) {
+        Some(p)
+            if p.device_id != mine.device_id
+                && p.user_id == mine.user_id
+                && p.conn.close_reason().is_none() =>
+        {
+            Some(p)
+        }
+        _ => None,
+    };
+    let Some(mut other) = partner else {
+        info!(session = %key, from = %mine.device_id, %peer_addr, "quic datagram relay waiting for peer");
+        map.insert(key, mine);
+        return Ok(());
+    };
+    drop(map);
+
+    // Note: datagram relay runs alongside the TCP/WS control session for the
+    // same peer pair, so it shares the account's bandwidth bucket and enforces
+    // a generous cap of `2 * limits.sessions` total sessions.
+    let acct = relay.account(&user_id);
+    if acct.sessions.fetch_add(1, Ordering::AcqRel) >= relay.limits.sessions.saturating_mul(2).max(1)
+    {
+        acct.sessions.fetch_sub(1, Ordering::AcqRel);
+        let _ = mine.ctrl_send.write_all(&[OVER_LIMIT]).await;
+        let _ = other.ctrl_send.write_all(&[OVER_LIMIT]).await;
+        mine.conn.close(2u32.into(), b"over limit");
+        other.conn.close(2u32.into(), b"over limit");
+        bail!("account {user_id} is at its relay session limit");
+    }
+
+    if let Err(e) = other.ctrl_send.write_all(&[READY]).await {
+        acct.sessions.fetch_sub(1, Ordering::AcqRel);
+        warn!(error = %e, session = %key, "waiting quic datagram relay died; parking new arriver");
+        if mine.conn.close_reason().is_none() {
+            let mut map = relay.dgram_pending.lock().await;
+            map.insert(key, mine);
+        }
+        return Ok(());
+    }
+    if let Err(e) = mine.ctrl_send.write_all(&[READY]).await {
+        acct.sessions.fetch_sub(1, Ordering::AcqRel);
+        other.conn.close(0u32.into(), b"partner died");
+        warn!(error = %e, session = %key, "new quic datagram relay died; dropping both");
+        return Ok(());
+    }
+
+    info!(session = %key, account = %user_id, "quic datagram relay session established");
+    let sid = relay.next_session_id.fetch_add(1, Ordering::Relaxed);
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    relay.active.lock().unwrap().insert(
+        sid,
+        ActiveSession {
+            dev_a: mine.device_id.clone(),
+            dev_b: other.device_id.clone(),
+            cancel: cancel_tx,
+        },
+    );
+    let relay_for_task = relay.clone();
+    let _p1 = mine._permit;
+    let _p2 = other._permit;
+    let conn_a = mine.conn;
+    let conn_b = other.conn;
+    tokio::spawn(async move {
+        let (_p1, _p2) = (_p1, _p2);
+        let pump = async {
+            tokio::select! {
+                _ = pump_quic_dgrams(conn_a.clone(), conn_b.clone(), acct.clone()) => {}
+                _ = pump_quic_dgrams(conn_b.clone(), conn_a.clone(), acct.clone()) => {}
+            }
+        };
+        tokio::select! {
+            _ = pump => {}
+            _ = cancel_rx => {
+                info!(session = %key, "quic datagram relay terminated due to device revocation");
+            }
+        }
+        conn_a.close(0u32.into(), b"relay closed");
+        conn_b.close(0u32.into(), b"relay closed");
+        relay_for_task.active.lock().unwrap().remove(&sid);
+        acct.sessions.fetch_sub(1, Ordering::AcqRel);
+    });
+    Ok(())
+}
+
+async fn pump_quic_dgrams(src: quinn::Connection, dst: quinn::Connection, acct: Arc<AccountRelay>) {
+    while let Ok(pkt) = src.read_datagram().await {
+        let n = pkt.len();
+        let wait = acct.bucket.lock().unwrap().take(n, Instant::now());
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+        let _ = dst.send_datagram(pkt);
+        acct.unflushed.fetch_add(n as u64, Ordering::Relaxed);
+    }
 }
 
 /// Copy one direction, charging the account's bucket before each write.
@@ -694,9 +931,17 @@ mod tests {
     async fn socket_alive_detects_peer_close() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let client = TcpStream::connect(addr).await.unwrap();
-        let (server, _) = listener.accept().await.unwrap();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
         assert!(socket_alive(&server));
+        // Writing early bytes must NOT be consumed by socket_alive (MSG_PEEK).
+        client.write_all(b"Z").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(socket_alive(&server));
+        let mut peeked = [0u8; 1];
+        server.read_exact(&mut peeked).await.unwrap();
+        assert_eq!(&peeked, b"Z");
+
         drop(client);
         let mut dead = false;
         for _ in 0..20 {
@@ -803,6 +1048,7 @@ mod tests {
                 RelayConn::from_duplex(server_a),
                 "127.0.0.1:1".parse().unwrap(),
                 r1,
+                None,
             )
             .await
             .unwrap();
@@ -812,6 +1058,7 @@ mod tests {
                 RelayConn::from_duplex(server_b),
                 "127.0.0.1:2".parse().unwrap(),
                 r2,
+                None,
             )
             .await
             .unwrap();
@@ -847,7 +1094,7 @@ mod tests {
         let r_tcp = relay.0.clone();
         tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
-            handle_tcp(stream, peer, r_tcp).await.unwrap();
+            handle_tcp(stream, peer, r_tcp, None).await.unwrap();
         });
         let mut tcp = TcpStream::connect(addr).await.unwrap();
 
@@ -858,6 +1105,7 @@ mod tests {
                 RelayConn::from_duplex(server_ws),
                 "127.0.0.1:9".parse().unwrap(),
                 r_ws,
+                None,
             )
             .await
             .unwrap();
@@ -887,5 +1135,113 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&buf, b"mixed");
+    }
+
+    #[tokio::test]
+    async fn quic_datagram_relay_pairs_and_forwards() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (relay, ka, kb) = test_relay().await;
+        let a_id = derive_id(ka.verifying_key().as_bytes());
+        let b_id = derive_id(kb.verifying_key().as_bytes());
+        let (_, hello_a) = hello(&ka, &b_id, 7);
+        let (_, hello_b) = hello(&kb, &a_id, 8);
+
+        let srv_tls = crate::tls::ServerTls::from_seed([55u8; 32]).unwrap();
+        let srv_cfg = srv_tls.quic_relay_server_config().unwrap();
+        let bound = relay
+            .listen_quic_datagram("127.0.0.1:0".parse().unwrap(), srv_cfg)
+            .await
+            .unwrap();
+
+        #[derive(Debug)]
+        struct NoVerify;
+        impl rustls::client::danger::ServerCertVerifier for NoVerify {
+            fn verify_server_cert(
+                &self,
+                _: &rustls::pki_types::CertificateDer<'_>,
+                _: &[rustls::pki_types::CertificateDer<'_>],
+                _: &rustls::pki_types::ServerName<'_>,
+                _: &[u8],
+                _: rustls::pki_types::UnixTime,
+            ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            }
+            fn verify_tls12_signature(
+                &self,
+                _: &[u8],
+                _: &rustls::pki_types::CertificateDer<'_>,
+                _: &rustls::DigitallySignedStruct,
+            ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+            }
+            fn verify_tls13_signature(
+                &self,
+                _: &[u8],
+                _: &rustls::pki_types::CertificateDer<'_>,
+                _: &rustls::DigitallySignedStruct,
+            ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+            }
+            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+                vec![rustls::SignatureScheme::ED25519]
+            }
+        }
+
+        let make_client = || {
+            let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth();
+            tls.alpn_protocols = vec![topaz_proto::mux::ALPN_DGRAM_RELAY.to_vec()];
+            let qc = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+            let mut c = quinn::ClientConfig::new(Arc::new(qc));
+            let mut tr = quinn::TransportConfig::default();
+            tr.datagram_receive_buffer_size(Some(256 * 1024));
+            tr.datagram_send_buffer_size(256 * 1024);
+            c.transport_config(Arc::new(tr));
+            let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            ep.set_default_client_config(c);
+            ep
+        };
+
+        let ep_a = make_client();
+        let ep_b = make_client();
+        let (conn_a, conn_b) = tokio::try_join!(
+            async { Ok::<_, anyhow::Error>(ep_a.connect(bound, "topaz-coord")?.await?) },
+            async { Ok::<_, anyhow::Error>(ep_b.connect(bound, "topaz-coord")?.await?) },
+        )
+        .unwrap();
+
+        let handshake = |conn: quinn::Connection, framed: Vec<u8>| async move {
+            let (mut s, mut r) = conn.open_bi().await.unwrap();
+            s.write_all(&framed).await.unwrap();
+            let _ = s.finish();
+            let mut ready = [0u8; 1];
+            tokio::time::timeout(Duration::from_secs(3), r.read_exact(&mut ready))
+                .await
+                .unwrap()
+                .unwrap();
+            ready[0]
+        };
+
+        let (ra, rb) = tokio::join!(
+            handshake(conn_a.clone(), hello_a),
+            handshake(conn_b.clone(), hello_b),
+        );
+        assert_eq!(ra, READY);
+        assert_eq!(rb, READY);
+
+        conn_a
+            .send_datagram(bytes::Bytes::from_static(b"e2e-cipher-pkt"))
+            .unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), conn_b.read_datagram())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, bytes::Bytes::from_static(b"e2e-cipher-pkt"));
     }
 }

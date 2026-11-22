@@ -29,7 +29,10 @@ use futures::future::BoxFuture;
 use tokio::sync::{mpsc, oneshot};
 
 use dial::{DialResult, HostMsg};
-use engine::{DatagramSink, Engine, EngineChannels, KickMsg, ProbeResult, StreamMsg};
+use engine::{
+    DatagramSink, Engine, EngineChannels, KickMsg, ProbeResult, RefreshResult, RegisterResult,
+    SessionReadyResult, StreamMsg,
+};
 
 pub use topaz_proto::mux::AdvertisedService;
 pub use mdns::MdnsPeers;
@@ -91,6 +94,10 @@ pub struct EngineDeps {
     pub force_relay: bool,
     /// Advertise and browse `_topaz._udp.local.` for LAN candidates.
     pub enable_mdns: bool,
+    /// Optional cached device entries loaded from disk for offline/resilient boot.
+    pub initial_devices: Vec<topaz_proto::DeviceEntry>,
+    /// Optional callback invoked whenever fresh verified entries arrive from coord.
+    pub on_devices_cached: Option<Arc<dyn Fn(&[topaz_proto::DeviceEntry]) + Send + Sync>>,
 }
 
 /// A peer session as services see it.
@@ -253,6 +260,8 @@ where
         signal_rx,
         force_relay,
         enable_mdns,
+        initial_devices,
+        on_devices_cached,
     } = deps;
 
     let (kick_tx, kick_rx) = mpsc::unbounded_channel::<KickMsg>();
@@ -267,6 +276,10 @@ where
     let (punched_tx, punched_rx) = mpsc::unbounded_channel::<PeerLink>();
     let (dial_done_tx, dial_done_rx) = mpsc::unbounded_channel::<DialResult>();
     let (probe_done_tx, probe_done_rx) = mpsc::unbounded_channel::<ProbeResult>();
+    let (refresh_done_tx, refresh_done_rx) = mpsc::unbounded_channel::<RefreshResult>();
+    let (register_done_tx, register_done_rx) = mpsc::unbounded_channel::<RegisterResult>();
+    let (session_ready_tx, session_ready_rx) = mpsc::unbounded_channel::<SessionReadyResult>();
+    let (endpoints_done_tx, endpoints_done_rx) = mpsc::unbounded_channel::<Vec<String>>();
 
     let handle = EngineHandle {
         kick_tx,
@@ -319,6 +332,18 @@ where
         punched_tx,
         dial_done_tx,
         probe_done_tx,
+        refresh_done_tx,
+        register_done_tx,
+        session_ready_tx,
+        endpoints_done_tx,
+        on_devices_cached,
+        refresh_in_flight: false,
+        register_in_flight: false,
+        endpoint_refresh_in_flight: false,
+        stun_advertised: None,
+        last_observed_ip: None,
+        last_endpoint_refresh: Instant::now(),
+        last_relay_upgrade: HashMap::new(),
         mdns_peers: MdnsPeers::default(),
         self_addr: VirtualAddr::default(),
         peers: Vec::new(),
@@ -351,8 +376,13 @@ where
                         punched_rx,
                         dial_done_rx,
                         probe_done_rx,
+                        refresh_done_rx,
+                        register_done_rx,
+                        session_ready_rx,
+                        endpoints_done_rx,
                     },
                     enable_mdns,
+                    initial_devices,
                     handle,
                 )
                 .await

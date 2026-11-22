@@ -19,11 +19,21 @@ use tokio_rustls::TlsAcceptor;
 use tower_service::Service;
 use tracing::{debug, warn};
 
-const MAX_CONCURRENT_CONNS: usize = 1024;
+const MAX_CONCURRENT_CONNS: usize = 4096;
+
+fn enable_tcp_keepalive(stream: &tokio::net::TcpStream) {
+    let sock = socket2::SockRef::from(stream);
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(15))
+        .with_interval(Duration::from_secs(5));
+    let _ = sock.set_tcp_keepalive(&ka);
+}
 
 #[derive(Clone)]
 pub struct ServerTls {
     pub pin: String,
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
     config: Arc<rustls::ServerConfig>,
 }
 
@@ -38,6 +48,7 @@ impl ServerTls {
             .to_vec();
         let key_pair = KeyPair::try_from(key_der.as_slice())?;
         let cert = CertificateParams::new(vec!["topaz-coord".into()])?.self_signed(&key_pair)?;
+        let cert_der = cert.der().to_vec();
 
         let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
@@ -45,14 +56,41 @@ impl ServerTls {
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_no_client_auth()
         .with_single_cert(
-            vec![CertificateDer::from(cert.der().to_vec())],
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der)),
+            vec![CertificateDer::from(cert_der.clone())],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der.clone())),
         )?;
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
         Ok(Self {
             pin,
+            cert_der,
+            key_der,
             config: Arc::new(config),
         })
+    }
+
+    /// Build a Quinn `ServerConfig` reusing the same pinned Ed25519 key for
+    /// the coord's UDP/QUIC unreliable datagram relay.
+    pub fn quic_relay_server_config(&self) -> Result<quinn::ServerConfig> {
+        let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(self.cert_der.clone())],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(self.key_der.clone())),
+        )?;
+        tls.alpn_protocols = vec![topaz_proto::mux::ALPN_DGRAM_RELAY.to_vec()];
+        let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)?;
+        let mut server = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
+        let mut transport = quinn::TransportConfig::default();
+        transport.initial_mtu(1350);
+        transport.max_idle_timeout(Some(Duration::from_secs(30).try_into()?));
+        transport.keep_alive_interval(Some(Duration::from_secs(10)));
+        transport.datagram_receive_buffer_size(Some(256 * 1024));
+        transport.datagram_send_buffer_size(1024 * 1024);
+        server.transport = Arc::new(transport);
+        Ok(server)
     }
 
     /// Serve `app` over TLS, inserting each connection's peer address as
@@ -76,6 +114,8 @@ impl ServerTls {
             };
             let acceptor = acceptor.clone();
             let app = app.clone();
+            enable_tcp_keepalive(&tcp);
+            let _ = tcp.set_nodelay(true);
             tokio::spawn(async move {
                 let _permit = permit;
                 let tls = match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(tcp)).await {

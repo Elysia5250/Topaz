@@ -1,98 +1,40 @@
-//! Jade-aligned Terminal UI (`topaz tui`) connected to the running daemon over
-//! `control.sock`.
+//! Jade-aligned full-lifecycle Terminal UI (`topaz` / `topaz tui`).
 //!
-//! Pure client: closing `topaz tui` or its terminal never stops `topaz run`.
+//! Pure client: closing the TUI never stops a running `topaz run` daemon.
+//! Seamlessly adapts across Onboarding (no account), Standby (daemon stopped),
+//! and Live Mesh (connected over `control.sock`).
 
+mod actions;
+mod bar;
 mod clipboard;
+mod input;
+mod modals;
+mod mouse;
 mod prefs;
+mod state;
 mod terminal;
 pub mod theme;
 mod view;
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use futures::StreamExt;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::client::ControlClient;
-use crate::ops::DeviceRow;
-use prefs::ConsolePrefs;
+use crate::run::ElevationError;
+
+use actions::{spawn_refresh_devices, spawn_refresh_local, spawn_reload_logs};
+use state::{
+    AppState, LocalSnapshot, Modal, OnboardingStep, PairStatus, StatusSnapshot, SudoModal, UiEvent,
+};
 use terminal::TerminalGuard;
 pub use theme::ThemeKind;
-
-#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
-pub struct TunSnapshot {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub interface: Option<String>,
-    #[serde(default)]
-    pub cidr: String,
-    #[serde(default)]
-    pub mtu: u16,
-    #[serde(default)]
-    pub dns_listen: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
-pub struct PeerServiceSnapshot {
-    pub service_id: u16,
-    pub name: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
-pub struct PeerSnapshot {
-    pub device_id: String,
-    pub name: String,
-    #[serde(default)]
-    pub dns_name: Option<String>,
-    #[serde(default)]
-    pub virtual_ip: Option<String>,
-    #[serde(default)]
-    pub path: Option<String>,
-    #[serde(default)]
-    pub rtt_ms: Option<u64>,
-    #[serde(default)]
-    pub services: Vec<PeerServiceSnapshot>,
-}
-
-#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
-pub struct LocalServiceSnapshot {
-    pub service_id: u16,
-    pub name: String,
-    #[serde(default)]
-    pub online: bool,
-    #[serde(default)]
-    pub listeners: usize,
-}
-
-#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
-pub struct StatusSnapshot {
-    #[serde(default)]
-    pub account: String,
-    #[serde(default)]
-    pub device_id: String,
-    #[serde(default)]
-    pub device_name: String,
-    #[serde(default)]
-    pub dns_name: Option<String>,
-    #[serde(default)]
-    pub virtual_ip: Option<String>,
-    #[serde(default)]
-    pub tun: TunSnapshot,
-    #[serde(default)]
-    pub connection: Option<String>,
-    #[serde(default)]
-    pub peers: Vec<PeerSnapshot>,
-    #[serde(default)]
-    pub services: Vec<LocalServiceSnapshot>,
-}
 
 #[derive(Debug, Clone, Deserialize)]
 struct EventEnvelope {
@@ -101,356 +43,45 @@ struct EventEnvelope {
     status: StatusSnapshot,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MergedPeer {
-    pub device_id: String,
-    pub name: String,
-    pub dns_name: Option<String>,
-    pub virtual_ip: Option<String>,
-    pub path: Option<String>,
-    pub rtt_ms: Option<u64>,
-    pub account_status: String,
-    pub issuer: Option<String>,
-    pub services: Vec<PeerServiceSnapshot>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FocusPane {
-    Peers,
-    Input,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Modal {
-    Palette {
-        query: String,
-        selected: usize,
-    },
-    Pairing {
-        code: Option<String>,
-        setup: Option<String>,
-        state: PairingState,
-    },
-    RevokeConfirm {
-        device_id: String,
-        name: String,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PairingState {
-    Starting,
-    Waiting,
-    Added { name: String, device_id: String },
-    Failed(String),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PaletteAction {
-    KickAnnounce,
-    KickLocal,
-    AddDevice,
-    CopyPeerAddr,
-    RevokeSelected,
-    Refresh,
-    ToggleSidebar,
-    CycleTheme,
-    ClearFilter,
-    StopDaemon,
-    Quit,
-}
-
-const PALETTE_ITEMS: &[(&str, &str, PaletteAction)] = &[
-    ("Kick peers (announce)", "Probe peers and broadcast endpoints", PaletteAction::KickAnnounce),
-    ("Kick peers (local only)", "Probe peers without announcing", PaletteAction::KickLocal),
-    ("Add new device", "Generate one-time pairing code & setup bundle", PaletteAction::AddDevice),
-    ("Copy peer address", "Copy selected peer's .topaz DNS or virtual IP", PaletteAction::CopyPeerAddr),
-    ("Revoke selected device", "Revoke cert for highlighted peer", PaletteAction::RevokeSelected),
-    ("Refresh devices", "Fetch latest /v1/devices and /v1/status", PaletteAction::Refresh),
-    ("Toggle sidebar", "Show or hide device list (Ctrl+B / Ctrl+X b)", PaletteAction::ToggleSidebar),
-    ("Cycle color theme", "Switch ink / tokyonight / light (Ctrl+X t)", PaletteAction::CycleTheme),
-    ("Clear peer filter", "Reset bottom filter input", PaletteAction::ClearFilter),
-    ("Stop daemon", "Shut down background topaz run cleanly", PaletteAction::StopDaemon),
-    ("Quit TUI", "Exit UI (daemon keeps running)", PaletteAction::Quit),
-];
-
-#[derive(Debug)]
-enum UiEvent {
-    Key(KeyEvent),
-    Resize,
-    WsConnected,
-    WsDisconnected(String),
-    StatusUpdated(Box<StatusSnapshot>),
-    DevicesUpdated(Vec<DeviceRow>),
-    ActionResult { ok: bool, message: String },
-    PairingCode { code: String, setup: String },
-    PairingFinished(std::result::Result<(String, String), String>),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InputCommand {
-    Kick { announce: bool },
-    Add,
-    Revoke { target: Option<String> },
-    Copy,
-    Refresh,
-    ToggleSidebar,
-    Theme { name: Option<String> },
-    StopDaemon,
-    Quit,
-    Help,
-}
-
-pub fn parse_input_command(raw: &str) -> std::result::Result<InputCommand, String> {
-    let trimmed = raw.trim().strip_prefix(':').unwrap_or(raw.trim()).trim();
-    let mut parts = trimmed.split_whitespace();
-    let Some(cmd) = parts.next() else {
-        return Err("empty command".into());
-    };
-    match cmd.to_ascii_lowercase().as_str() {
-        "k" | "kick" => {
-            let local = parts.next().is_some_and(|a| a == "local" || a == "--local");
-            Ok(InputCommand::Kick { announce: !local })
-        }
-        "a" | "add" | "pair" => Ok(InputCommand::Add),
-        "r" | "revoke" => Ok(InputCommand::Revoke {
-            target: parts.next().map(|s| s.to_string()),
-        }),
-        "c" | "y" | "copy" => Ok(InputCommand::Copy),
-        "refresh" | "reload" => Ok(InputCommand::Refresh),
-        "sidebar" | "b" | "panel" => Ok(InputCommand::ToggleSidebar),
-        "theme" => Ok(InputCommand::Theme {
-            name: parts.next().map(|s| s.to_string()),
-        }),
-        "stop" => Ok(InputCommand::StopDaemon),
-        "q" | "quit" | "exit" => Ok(InputCommand::Quit),
-        "h" | "help" | "?" => Ok(InputCommand::Help),
-        other => Err(format!(
-            "unknown command ':{other}' (try :kick, :add, :revoke, :copy, :theme, :stop, :quit)"
-        )),
-    }
-}
-
-/// Merge live `/v1/status` peers with `/v1/devices` (including offline/revoked)
-/// and filter by `query` (case-insensitive match on name, dns_name, IP, ID, or plugin name).
-pub fn merge_peers(
-    status: &StatusSnapshot,
-    devices: &[DeviceRow],
-    filter: &str,
-) -> Vec<MergedPeer> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-
-    for d in devices {
-        if d.me {
-            continue;
-        }
-        seen.insert(d.device_id.clone());
-        let live = status.peers.iter().find(|p| p.device_id == d.device_id);
-        out.push(MergedPeer {
-            device_id: d.device_id.clone(),
-            name: live.map(|p| p.name.clone()).unwrap_or_else(|| d.name.clone()),
-            dns_name: live
-                .and_then(|p| p.dns_name.clone())
-                .or_else(|| d.dns_name.clone()),
-            virtual_ip: live
-                .and_then(|p| p.virtual_ip.clone())
-                .or_else(|| d.virtual_ip.clone()),
-            path: live.and_then(|p| p.path.clone()),
-            rtt_ms: live.and_then(|p| p.rtt_ms),
-            account_status: d.status.clone(),
-            issuer: Some(d.issuer.clone()),
-            services: live.map(|p| p.services.clone()).unwrap_or_default(),
-        });
-    }
-
-    for p in &status.peers {
-        if seen.insert(p.device_id.clone()) {
-            out.push(MergedPeer {
-                device_id: p.device_id.clone(),
-                name: p.name.clone(),
-                dns_name: p.dns_name.clone(),
-                virtual_ip: p.virtual_ip.clone(),
-                path: p.path.clone(),
-                rtt_ms: p.rtt_ms,
-                account_status: "active".into(),
-                issuer: None,
-                services: p.services.clone(),
-            });
-        }
-    }
-
-    out.sort_by(|a, b| {
-        let a_rank = match (a.account_status == "active", a.path.is_some()) {
-            (true, true) => 0u8,
-            (true, false) => 1u8,
-            (false, _) => 2u8,
-        };
-        let b_rank = match (b.account_status == "active", b.path.is_some()) {
-            (true, true) => 0u8,
-            (true, false) => 1u8,
-            (false, _) => 2u8,
-        };
-        a_rank
-            .cmp(&b_rank)
-            .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
-            .then_with(|| a.device_id.cmp(&b.device_id))
-    });
-
-    let q = filter.trim().to_ascii_lowercase();
-    if q.is_empty() {
-        return out;
-    }
-    out.into_iter()
-        .filter(|p| {
-            p.name.to_ascii_lowercase().contains(&q)
-                || p.device_id.to_ascii_lowercase().contains(&q)
-                || p.dns_name
-                    .as_deref()
-                    .is_some_and(|d| d.to_ascii_lowercase().contains(&q))
-                || p.virtual_ip
-                    .as_deref()
-                    .is_some_and(|ip| ip.to_ascii_lowercase().contains(&q))
-                || p.services
-                    .iter()
-                    .any(|s| s.name.to_ascii_lowercase().contains(&q))
-        })
-        .collect()
-}
-
-pub struct AppState {
-    pub theme: ThemeKind,
-    pub sidebar_visible: bool,
-    pub focus: FocusPane,
-    pub input: String,
-    pub status: StatusSnapshot,
-    pub devices: Vec<DeviceRow>,
-    pub ws_connected: bool,
-    pub selected_idx: usize,
-    pub selected_id: Option<String>,
-    pub modal: Option<Modal>,
-    pub leader_until: Option<Instant>,
-    pub toast: Option<(String, bool, Instant)>,
-    pub activity: Vec<String>,
-    pub should_quit: bool,
-}
-
-impl AppState {
-    pub fn new(theme: ThemeKind, sidebar_visible: bool) -> Self {
-        Self {
-            theme,
-            sidebar_visible,
-            focus: FocusPane::Peers,
-            input: String::new(),
-            status: StatusSnapshot::default(),
-            devices: Vec::new(),
-            ws_connected: false,
-            selected_idx: 0,
-            selected_id: None,
-            modal: None,
-            leader_until: None,
-            toast: None,
-            activity: vec!["Connecting to local control.sock…".into()],
-            should_quit: false,
-        }
-    }
-
-    pub fn filter_query(&self) -> &str {
-        if self.input.starts_with(':') {
-            ""
-        } else {
-            self.input.trim()
-        }
-    }
-
-    pub fn filtered_peers(&self) -> Vec<MergedPeer> {
-        merge_peers(&self.status, &self.devices, self.filter_query())
-    }
-
-    pub fn selected_peer(&self) -> Option<MergedPeer> {
-        let peers = self.filtered_peers();
-        if peers.is_empty() {
-            return None;
-        }
-        let idx = self.selected_idx.min(peers.len() - 1);
-        peers.into_iter().nth(idx)
-    }
-
-    pub fn reconcile_selection(&mut self) {
-        let peers = self.filtered_peers();
-        if peers.is_empty() {
-            self.selected_idx = 0;
-            self.selected_id = None;
-            return;
-        }
-        if let Some(ref id) = self.selected_id {
-            if let Some(pos) = peers.iter().position(|p| &p.device_id == id) {
-                self.selected_idx = pos;
-                return;
-            }
-        }
-        self.selected_idx = self.selected_idx.min(peers.len() - 1);
-        self.selected_id = Some(peers[self.selected_idx].device_id.clone());
-    }
-
-    pub fn move_selection(&mut self, delta: isize) {
-        let peers = self.filtered_peers();
-        if peers.is_empty() {
-            self.selected_idx = 0;
-            self.selected_id = None;
-            return;
-        }
-        let len = peers.len() as isize;
-        let next = (self.selected_idx as isize + delta).clamp(0, len - 1) as usize;
-        self.selected_idx = next;
-        self.selected_id = Some(peers[next].device_id.clone());
-    }
-
-    fn push_activity(&mut self, line: impl Into<String>) {
-        self.activity.push(line.into());
-        if self.activity.len() > 60 {
-            let drain = self.activity.len() - 60;
-            self.activity.drain(..drain);
-        }
-    }
-
-    fn set_toast(&mut self, ok: bool, msg: impl Into<String>) {
-        let msg = msg.into();
-        self.push_activity(msg.clone());
-        self.toast = Some((msg, ok, Instant::now() + Duration::from_secs(4)));
-    }
-
-    fn save_prefs(&self, data_dir: &Path) {
-        prefs::save(
-            data_dir,
-            &ConsolePrefs {
-                theme: self.theme.label().to_string(),
-                show_sidebar: self.sidebar_visible,
-            },
-        );
-    }
-}
-
 pub async fn cmd_tui(data_dir: PathBuf, theme_override: Option<&str>) -> Result<()> {
     let saved = prefs::load(&data_dir);
     let theme = match theme_override {
         Some(name) => ThemeKind::from_name(name),
         None => ThemeKind::from_name(&saved.theme),
     };
+    let local = LocalSnapshot::load(&data_dir);
     let mut guard = TerminalGuard::enter()?;
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<UiEvent>();
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    tokio::spawn(events_loop(data_dir.clone(), ev_tx.clone(), shutdown_rx.clone()));
-    tokio::spawn(devices_poll_loop(data_dir.clone(), ev_tx.clone(), shutdown_rx.clone()));
+    tokio::spawn(events_loop(
+        data_dir.clone(),
+        ev_tx.clone(),
+        shutdown_rx.clone(),
+    ));
+    tokio::spawn(devices_poll_loop(
+        data_dir.clone(),
+        ev_tx.clone(),
+        shutdown_rx.clone(),
+    ));
+    tokio::spawn(uptime_poll_loop(
+        data_dir.clone(),
+        ev_tx.clone(),
+        shutdown_rx.clone(),
+    ));
     spawn_input_reader(ev_tx.clone(), shutdown_rx);
 
-    let mut app = AppState::new(theme, saved.show_sidebar);
-    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    let mut app = AppState::new(theme, &saved, local);
+    app.mouse_capture = guard.mouse_capture;
+    let mut tick = tokio::time::interval(Duration::from_millis(120));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
-        guard.terminal.draw(|f| view::draw_ui(f, &app))?;
+        if let Some(next_mouse) = app.pending_mouse_toggle.take() {
+            guard.set_mouse_capture(next_mouse);
+        }
+
+        guard.terminal.draw(|f| view::draw_ui(f, &mut app))?;
         if app.should_quit {
             break;
         }
@@ -465,7 +96,13 @@ pub async fn cmd_tui(data_dir: PathBuf, theme_override: Option<&str>) -> Result<
                     }
                 }
             }
-            _ = tick.tick() => {}
+            _ = tick.tick() => {
+                app.tick_count = app.tick_count.wrapping_add(1);
+                // Live-refresh daemon log viewer roughly every ~1.2s while open.
+                if matches!(app.modal, Some(Modal::Logs(_))) && app.tick_count % 10 == 0 {
+                    spawn_reload_logs(data_dir.clone(), ev_tx.clone());
+                }
+            }
         }
 
         if let Some((_, _, until)) = app.toast {
@@ -473,13 +110,9 @@ pub async fn cmd_tui(data_dir: PathBuf, theme_override: Option<&str>) -> Result<
                 app.toast = None;
             }
         }
-        if let Some(until) = app.leader_until {
-            if Instant::now() >= until {
-                app.leader_until = None;
-            }
-        }
     }
 
+    app.cancel_pair_task();
     let _ = shutdown_tx.send(true);
     Ok(())
 }
@@ -492,12 +125,22 @@ fn spawn_input_reader(
         if *shutdown.borrow() {
             break;
         }
-        match event::poll(Duration::from_millis(120)) {
+        match event::poll(Duration::from_millis(80)) {
             Ok(true) => match event::read() {
                 Ok(Event::Key(key))
                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                 {
                     if tx.send(UiEvent::Key(key)).is_err() {
+                        break;
+                    }
+                }
+                Ok(Event::Mouse(m)) => {
+                    if tx.send(UiEvent::Mouse(m)).is_err() {
+                        break;
+                    }
+                }
+                Ok(Event::Paste(text)) => {
+                    if tx.send(UiEvent::Paste(text)).is_err() {
                         break;
                     }
                 }
@@ -522,9 +165,210 @@ fn process_event(
     ev_tx: &mpsc::UnboundedSender<UiEvent>,
 ) {
     match ev {
-        UiEvent::Key(key) => handle_key(app, key, data_dir, ev_tx),
+        UiEvent::Key(key) => input::handle_key(app, key, data_dir, ev_tx),
+        UiEvent::Mouse(m) => mouse::handle_mouse(app, m, data_dir, ev_tx),
+        UiEvent::Paste(text) => input::handle_paste(app, &text),
         UiEvent::Resize => {}
-        other => handle_ui_event(app, other),
+        other => handle_ui_event(app, other, data_dir, ev_tx),
+    }
+}
+
+fn handle_ui_event(
+    app: &mut AppState,
+    ev: UiEvent,
+    data_dir: &Path,
+    ev_tx: &mpsc::UnboundedSender<UiEvent>,
+) {
+    match ev {
+        UiEvent::WsConnected => {
+            app.ws_connected = true;
+            app.busy_banner = None;
+            spawn_refresh_local(data_dir.to_path_buf(), ev_tx.clone());
+        }
+        UiEvent::WsDisconnected => {
+            app.ws_connected = false;
+            app.local.uptime_s = None;
+            app.status = StatusSnapshot::default();
+            app.reconcile_selection();
+        }
+        UiEvent::UptimeUpdated(up) => {
+            app.local.uptime_s = up;
+        }
+        UiEvent::StatusUpdated(next) => {
+            app.status = *next;
+            app.reconcile_selection();
+        }
+        UiEvent::DevicesUpdated(rows) => {
+            app.devices = rows;
+            app.reconcile_selection();
+        }
+        UiEvent::LocalRefreshed(snap) => {
+            let uptime = app.local.uptime_s;
+            app.local = snap;
+            app.local.uptime_s = uptime;
+        }
+        UiEvent::ActionResult { ok, message } => {
+            app.busy_banner = None;
+            app.set_toast(ok, message);
+        }
+        UiEvent::DaemonStarted { ok, message } => {
+            app.busy_banner = None;
+            app.set_toast(ok, message);
+            if ok {
+                spawn_refresh_local(data_dir.to_path_buf(), ev_tx.clone());
+            }
+        }
+        UiEvent::NeedSudoPrompt { restart_first } => {
+            app.busy_banner = None;
+            app.modal = Some(Modal::SudoPrompt(SudoModal::new(data_dir, restart_first)));
+        }
+        UiEvent::SudoResult(res) => match res {
+            Ok(msg) => {
+                app.close_modal();
+                app.set_toast(true, msg);
+                spawn_refresh_local(data_dir.to_path_buf(), ev_tx.clone());
+            }
+            Err(ElevationError::IncorrectPassword) => {
+                if let Some(Modal::SudoPrompt(ref mut s)) = app.modal {
+                    s.busy = false;
+                    s.password.zeroize_clear();
+                    s.error = Some("Incorrect password — please try again".into());
+                }
+            }
+            Err(ElevationError::PasswordRequired) => {
+                if let Some(Modal::SudoPrompt(ref mut s)) = app.modal {
+                    s.busy = false;
+                    s.error = Some("Administrator password required".into());
+                }
+            }
+            Err(ElevationError::Failed(err)) => {
+                if let Some(Modal::SudoPrompt(ref mut s)) = app.modal {
+                    s.busy = false;
+                    s.error = Some(err);
+                }
+            }
+        },
+        UiEvent::PairCodeReady { code, setup } => {
+            if let Some(Modal::Pair(ref mut p)) = app.modal {
+                p.status = PairStatus::WaitingBundle { code, setup };
+            }
+        }
+        UiEvent::PairPeerIncoming {
+            device_name,
+            device_id,
+            sas,
+            decision_tx,
+        } => {
+            app.pair_decision_tx = Some(decision_tx);
+            if let Some(Modal::Pair(ref mut p)) = app.modal {
+                p.status = PairStatus::ConfirmPeer {
+                    device_name,
+                    device_id,
+                    sas,
+                };
+            }
+        }
+        UiEvent::PairFinished(res) => {
+            app.pair_abort = None;
+            app.pair_decision_tx = None;
+            match res {
+                Ok((name, device_id)) => {
+                    app.set_toast(true, format!("Added {name} ({device_id})"));
+                    if let Some(Modal::Pair(ref mut p)) = app.modal {
+                        p.status = PairStatus::Added { name, device_id };
+                    }
+                }
+                Err(err) => {
+                    app.set_toast(false, format!("Pairing failed: {err}"));
+                    if let Some(Modal::Pair(ref mut p)) = app.modal {
+                        p.status = PairStatus::Failed(err);
+                    }
+                }
+            }
+        }
+        UiEvent::OnboardingPinProbed(res) => {
+            if let Some(Modal::OnboardingForm(ref mut ob)) = app.modal {
+                match res {
+                    Ok((coord_url, pin)) => {
+                        ob.step = OnboardingStep::TofuConfirm { coord_url, pin };
+                    }
+                    Err(err) => {
+                        ob.step = OnboardingStep::Form;
+                        ob.error = Some(format!("Failed to probe coord: {err}"));
+                    }
+                }
+            }
+        }
+        UiEvent::OnboardingDone {
+            account_id,
+            recovery_code,
+        } => {
+            app.local = LocalSnapshot::load(data_dir);
+            if let Some(code) = recovery_code {
+                if let Some(Modal::OnboardingForm(ref mut ob)) = app.modal {
+                    ob.step = OnboardingStep::RecoveryBackup {
+                        account_id,
+                        recovery_code: code,
+                    };
+                }
+            } else {
+                app.close_modal();
+                app.set_toast(
+                    true,
+                    format!("Joined account {account_id} — start TUN or Session Mode to connect"),
+                );
+                spawn_refresh_devices(data_dir.to_path_buf(), ev_tx.clone());
+            }
+        }
+        UiEvent::OnboardingFailed(err) => {
+            if let Some(Modal::OnboardingForm(ref mut ob)) = app.modal {
+                ob.step = OnboardingStep::Form;
+                ob.error = Some(err);
+            }
+        }
+        UiEvent::DoctorUpdate(report) => {
+            if let Some(Modal::Doctor(ref mut d)) = app.modal {
+                d.report = report;
+            }
+        }
+        UiEvent::DoctorError(err) => {
+            app.set_toast(false, format!("Doctor error: {err}"));
+        }
+        UiEvent::LogsLoaded(lines) => {
+            if let Some(Modal::Logs(ref mut l)) = app.modal {
+                l.lines = lines;
+            }
+        }
+        UiEvent::SettingsPinProbed(res) => {
+            if let Some(Modal::Settings(ref mut s)) = app.modal {
+                s.probing_pin = false;
+                match res {
+                    Ok(pin) => {
+                        s.coord_pin = state::TextField::new("32-char base32 TLS pin").with_value(pin);
+                        s.error = None;
+                        app.set_toast(true, "Probed coord TLS pin — press Save to apply");
+                    }
+                    Err(err) => {
+                        s.error = Some(format!("Pin probe failed: {err}"));
+                    }
+                }
+            }
+        }
+        UiEvent::RevokeFinished(res) => match res {
+            Ok(msg) => {
+                app.close_modal();
+                app.set_toast(true, msg);
+            }
+            Err(err) => {
+                if let Some(Modal::RevokeConfirm(ref mut r)) = app.modal {
+                    r.busy = false;
+                    r.error = Some(err);
+                } else {
+                    app.set_toast(false, format!("Revoke failed: {err}"));
+                }
+            }
+        },
+        UiEvent::Key(_) | UiEvent::Mouse(_) | UiEvent::Paste(_) | UiEvent::Resize => {}
     }
 }
 
@@ -539,50 +383,45 @@ async fn events_loop(
             break;
         }
         match tokio::net::UnixStream::connect(&sock_path).await {
-            Ok(stream) => match tokio_tungstenite::client_async("ws://localhost/v1/events", stream).await
-            {
-                Ok((mut ws, _)) => {
-                    let _ = tx.send(UiEvent::WsConnected);
-                    spawn_refresh_devices(data_dir.clone(), tx.clone());
-                    loop {
-                        tokio::select! {
-                            _ = shutdown.changed() => return,
-                            frame = ws.next() => {
-                                match frame {
-                                    Some(Ok(WsMessage::Text(text))) => {
-                                        if let Ok(env) = serde_json::from_str::<EventEnvelope>(&text) {
-                                            if env.kind == "status" {
-                                                let _ = tx.send(UiEvent::StatusUpdated(Box::new(env.status)));
+            Ok(stream) => {
+                match tokio_tungstenite::client_async("ws://localhost/v1/events", stream).await {
+                    Ok((mut ws, _)) => {
+                        let _ = tx.send(UiEvent::WsConnected);
+                        spawn_refresh_devices(data_dir.clone(), tx.clone());
+                        loop {
+                            tokio::select! {
+                                _ = shutdown.changed() => return,
+                                frame = ws.next() => {
+                                    match frame {
+                                        Some(Ok(WsMessage::Text(text))) => {
+                                            if let Ok(env) = serde_json::from_str::<EventEnvelope>(&text) {
+                                                if env.kind == "status" {
+                                                    let _ = tx.send(UiEvent::StatusUpdated(Box::new(env.status)));
+                                                }
                                             }
                                         }
+                                        Some(Ok(WsMessage::Close(_))) | None | Some(Err(_)) => {
+                                            let _ = tx.send(UiEvent::WsDisconnected);
+                                            break;
+                                        }
+                                        Some(Ok(_)) => {}
                                     }
-                                    Some(Ok(WsMessage::Close(_))) | None => {
-                                        let _ = tx.send(UiEvent::WsDisconnected("control.sock stream closed".into()));
-                                        break;
-                                    }
-                                    Some(Err(e)) => {
-                                        let _ = tx.send(UiEvent::WsDisconnected(format!("ws error: {e}")));
-                                        break;
-                                    }
-                                    Some(Ok(_)) => {}
                                 }
                             }
                         }
                     }
+                    Err(_) => {
+                        let _ = tx.send(UiEvent::WsDisconnected);
+                    }
                 }
-                Err(e) => {
-                    let _ = tx.send(UiEvent::WsDisconnected(format!("ws handshake failed: {e}")));
-                }
-            },
+            }
             Err(_) => {
-                let _ = tx.send(UiEvent::WsDisconnected(
-                    "waiting for daemon (`topaz run --detach`)".into(),
-                ));
+                let _ = tx.send(UiEvent::WsDisconnected);
             }
         }
         tokio::select! {
             _ = shutdown.changed() => return,
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            _ = tokio::time::sleep(Duration::from_millis(800)) => {}
         }
     }
 }
@@ -604,542 +443,22 @@ async fn devices_poll_loop(
     }
 }
 
-fn spawn_refresh_devices(data_dir: PathBuf, tx: mpsc::UnboundedSender<UiEvent>) {
-    tokio::spawn(async move {
+async fn uptime_poll_loop(
+    data_dir: PathBuf,
+    tx: mpsc::UnboundedSender<UiEvent>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
         let client = ControlClient::new(&data_dir);
-        if let Ok(v) = client.get("/v1/devices").await {
-            if let Some(arr) = v.get("devices").cloned() {
-                if let Ok(rows) = serde_json::from_value::<Vec<DeviceRow>>(arr) {
-                    let _ = tx.send(UiEvent::DevicesUpdated(rows));
-                }
-            }
+        if let Ok(v) = client.get("/healthz").await {
+            let _ = tx.send(UiEvent::UptimeUpdated(v["uptime_s"].as_u64()));
         }
-    });
-}
-
-fn spawn_kick(data_dir: PathBuf, announce: bool, tx: mpsc::UnboundedSender<UiEvent>) {
-    tokio::spawn(async move {
-        let client = ControlClient::new(&data_dir);
-        let path = format!("/v1/kick?announce={announce}");
-        let res = client.post(&path, None).await;
-        let _ = tx.send(match res {
-            Ok(_) => UiEvent::ActionResult {
-                ok: true,
-                message: if announce {
-                    "Kicked peers (announce)".into()
-                } else {
-                    "Kicked peers (local)".into()
-                },
-            },
-            Err(e) => UiEvent::ActionResult {
-                ok: false,
-                message: format!("Kick failed: {e}"),
-            },
-        });
-    });
-}
-
-fn spawn_stop_daemon(data_dir: PathBuf, tx: mpsc::UnboundedSender<UiEvent>) {
-    tokio::spawn(async move {
-        let client = ControlClient::new(&data_dir);
-        let res = client.post("/v1/shutdown", None).await;
-        let _ = tx.send(match res {
-            Ok(_) => UiEvent::ActionResult {
-                ok: true,
-                message: "Daemon shutdown requested".into(),
-            },
-            Err(e) => UiEvent::ActionResult {
-                ok: false,
-                message: format!("Stop failed: {e}"),
-            },
-        });
-    });
-}
-
-fn spawn_add_device(data_dir: PathBuf, tx: mpsc::UnboundedSender<UiEvent>) {
-    tokio::spawn(async move {
-        let client = ControlClient::new(&data_dir);
-        match client.post("/v1/devices/add", None).await {
-            Ok(v) => {
-                let code = v["code"].as_str().unwrap_or_default().to_string();
-                let setup = v["setup"].as_str().unwrap_or_default().to_string();
-                let _ = tx.send(UiEvent::PairingCode {
-                    code: code.clone(),
-                    setup,
-                });
-                let poll_res = client
-                    .get_with_timeout(&format!("/v1/devices/add/{code}"), Duration::from_secs(330))
-                    .await;
-                match poll_res {
-                    Ok(done) => {
-                        let name = done["name"].as_str().unwrap_or("?").to_string();
-                        let id = done["device_id"].as_str().unwrap_or("?").to_string();
-                        let _ = tx.send(UiEvent::PairingFinished(Ok((name, id))));
-                        spawn_refresh_devices(data_dir, tx);
-                    }
-                    Err(e) => {
-                        let _ = tx.send(UiEvent::PairingFinished(Err(e.to_string())));
-                    }
-                }
-            }
-            Err(e) => {
-                let _ = tx.send(UiEvent::PairingFinished(Err(e.to_string())));
-            }
-        }
-    });
-}
-
-fn spawn_revoke(data_dir: PathBuf, device_id: String, name: String, tx: mpsc::UnboundedSender<UiEvent>) {
-    tokio::spawn(async move {
-        let client = ControlClient::new(&data_dir);
-        let res = client
-            .post(&format!("/v1/devices/{device_id}/revoke"), None)
-            .await;
-        match res {
-            Ok(_) => {
-                let _ = tx.send(UiEvent::ActionResult {
-                    ok: true,
-                    message: format!("Revoked {name} ({device_id})"),
-                });
-                spawn_refresh_devices(data_dir, tx);
-            }
-            Err(e) => {
-                let _ = tx.send(UiEvent::ActionResult {
-                    ok: false,
-                    message: format!("Revoke failed: {e}"),
-                });
-            }
-        }
-    });
-}
-
-fn handle_ui_event(app: &mut AppState, ev: UiEvent) {
-    match ev {
-        UiEvent::WsConnected => {
-            if !app.ws_connected {
-                app.push_activity("Connected to control.sock /v1/events");
-            }
-            app.ws_connected = true;
-        }
-        UiEvent::WsDisconnected(reason) => {
-            if app.ws_connected {
-                app.push_activity(format!("Disconnected: {reason}"));
-            }
-            app.ws_connected = false;
-        }
-        UiEvent::StatusUpdated(next) => {
-            app.status = *next;
-            app.reconcile_selection();
-        }
-        UiEvent::DevicesUpdated(rows) => {
-            app.devices = rows;
-            app.reconcile_selection();
-        }
-        UiEvent::ActionResult { ok, message } => {
-            app.set_toast(ok, message);
-        }
-        UiEvent::PairingCode { code, setup } => {
-            app.push_activity(format!("Pairing code ready: {code}"));
-            app.modal = Some(Modal::Pairing {
-                code: Some(code),
-                setup: Some(setup),
-                state: PairingState::Waiting,
-            });
-        }
-        UiEvent::PairingFinished(res) => match res {
-            Ok((name, device_id)) => {
-                app.set_toast(true, format!("Added device {name} ({device_id})"));
-                if let Some(Modal::Pairing { state, .. }) = &mut app.modal {
-                    *state = PairingState::Added { name, device_id };
-                }
-            }
-            Err(err) => {
-                app.set_toast(false, format!("Pairing failed: {err}"));
-                if let Some(Modal::Pairing { state, .. }) = &mut app.modal {
-                    *state = PairingState::Failed(err);
-                }
-            }
-        },
-        UiEvent::Key(_) | UiEvent::Resize => {}
-    }
-}
-
-fn handle_key(
-    app: &mut AppState,
-    key: KeyEvent,
-    data_dir: &Path,
-    ev_tx: &mpsc::UnboundedSender<UiEvent>,
-) {
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        app.should_quit = true;
-        return;
-    }
-
-    if app.modal.is_some() {
-        handle_modal_key(app, key, data_dir, ev_tx);
-        return;
-    }
-
-    if app.leader_until.is_some() {
-        app.leader_until = None;
-        match key.code {
-            KeyCode::Char('q') => app.should_quit = true,
-            KeyCode::Char('b') => {
-                app.sidebar_visible = !app.sidebar_visible;
-                app.save_prefs(data_dir);
-            }
-            KeyCode::Char('t') => {
-                app.theme = app.theme.cycle();
-                app.save_prefs(data_dir);
-                app.set_toast(true, format!("Theme: {}", app.theme.label()));
-            }
-            KeyCode::Char('k') => spawn_kick(data_dir.to_path_buf(), true, ev_tx.clone()),
-            KeyCode::Char('a') => start_pairing(app, data_dir, ev_tx),
-            KeyCode::Char('p') => open_palette(app),
-            _ => {}
-        }
-        return;
-    }
-
-    if key.modifiers.contains(KeyModifiers::CONTROL) {
-        match key.code {
-            KeyCode::Char('p') => {
-                open_palette(app);
-                return;
-            }
-            KeyCode::Char('b') => {
-                app.sidebar_visible = !app.sidebar_visible;
-                app.save_prefs(data_dir);
-                return;
-            }
-            KeyCode::Char('x') => {
-                app.leader_until = Some(Instant::now() + Duration::from_secs(2));
-                return;
-            }
-            _ => {}
-        }
-    }
-
-    if key.code == KeyCode::Tab {
-        app.focus = match app.focus {
-            FocusPane::Peers => FocusPane::Input,
-            FocusPane::Input => FocusPane::Peers,
-        };
-        return;
-    }
-
-    match app.focus {
-        FocusPane::Input => handle_input_key(app, key, data_dir, ev_tx),
-        FocusPane::Peers => handle_peers_key(app, key, data_dir, ev_tx),
-    }
-}
-
-fn handle_peers_key(
-    app: &mut AppState,
-    key: KeyEvent,
-    data_dir: &Path,
-    ev_tx: &mpsc::UnboundedSender<UiEvent>,
-) {
-    match key.code {
-        KeyCode::Char('q') => app.should_quit = true,
-        KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
-        KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
-        KeyCode::Char('g') => app.move_selection(-10_000),
-        KeyCode::Char('G') => app.move_selection(10_000),
-        KeyCode::Char('b') => {
-            app.sidebar_visible = !app.sidebar_visible;
-            app.save_prefs(data_dir);
-        }
-        KeyCode::Char('t') => {
-            app.theme = app.theme.cycle();
-            app.save_prefs(data_dir);
-            app.set_toast(true, format!("Theme: {}", app.theme.label()));
-        }
-        KeyCode::Char('K') => spawn_kick(data_dir.to_path_buf(), true, ev_tx.clone()),
-        KeyCode::Char('r') => {
-            spawn_refresh_devices(data_dir.to_path_buf(), ev_tx.clone());
-            app.set_toast(true, "Refreshing device list…");
-        }
-        KeyCode::Char('a') => start_pairing(app, data_dir, ev_tx),
-        KeyCode::Char('y') => copy_selected_peer(app),
-        KeyCode::Char('x') => prompt_revoke_selected(app),
-        KeyCode::Char('/') => {
-            app.focus = FocusPane::Input;
-            if app.input.starts_with(':') {
-                app.input.clear();
-            }
-        }
-        KeyCode::Char(':') => {
-            app.focus = FocusPane::Input;
-            app.input = ":".into();
-        }
-        KeyCode::Esc if !app.input.is_empty() => {
-            app.input.clear();
-            app.reconcile_selection();
-        }
-        _ => {}
-    }
-}
-
-fn handle_input_key(
-    app: &mut AppState,
-    key: KeyEvent,
-    data_dir: &Path,
-    ev_tx: &mpsc::UnboundedSender<UiEvent>,
-) {
-    match key.code {
-        KeyCode::Esc => {
-            app.focus = FocusPane::Peers;
-            if app.input.starts_with(':') {
-                app.input.clear();
-            }
-        }
-        KeyCode::Enter => {
-            if app.input.starts_with(':') {
-                let raw = std::mem::take(&mut app.input);
-                app.focus = FocusPane::Peers;
-                match parse_input_command(&raw) {
-                    Ok(cmd) => execute_input_command(app, cmd, data_dir, ev_tx),
-                    Err(msg) => app.set_toast(false, msg),
-                }
-            } else {
-                app.focus = FocusPane::Peers;
-            }
-        }
-        KeyCode::Backspace => {
-            app.input.pop();
-            app.reconcile_selection();
-        }
-        KeyCode::Char(c)
-            if !key.modifiers.contains(KeyModifiers::CONTROL)
-                && !key.modifiers.contains(KeyModifiers::ALT) =>
-        {
-            app.input.push(c);
-            app.reconcile_selection();
-        }
-        _ => {}
-    }
-}
-
-fn handle_modal_key(
-    app: &mut AppState,
-    key: KeyEvent,
-    data_dir: &Path,
-    ev_tx: &mpsc::UnboundedSender<UiEvent>,
-) {
-    let Some(modal) = app.modal.clone() else {
-        return;
-    };
-    match modal {
-        Modal::Palette {
-            mut query,
-            mut selected,
-        } => match key.code {
-            KeyCode::Esc => app.modal = None,
-            KeyCode::Down => {
-                let len = filtered_palette(&query).len();
-                if len > 0 {
-                    selected = (selected + 1).min(len - 1);
-                }
-                app.modal = Some(Modal::Palette { query, selected });
-            }
-            KeyCode::Up => {
-                selected = selected.saturating_sub(1);
-                app.modal = Some(Modal::Palette { query, selected });
-            }
-            KeyCode::Backspace => {
-                query.pop();
-                selected = 0;
-                app.modal = Some(Modal::Palette { query, selected });
-            }
-            KeyCode::Enter => {
-                let matches = filtered_palette(&query);
-                app.modal = None;
-                if let Some(&(_, _, action)) = matches.get(selected) {
-                    run_palette_action(app, *action, data_dir, ev_tx);
-                }
-            }
-            KeyCode::Char(c)
-                if !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::ALT) =>
-            {
-                query.push(c);
-                selected = 0;
-                app.modal = Some(Modal::Palette { query, selected });
-            }
-            _ => {}
-        },
-        Modal::Pairing { setup, .. } => match key.code {
-            KeyCode::Char('c') => {
-                if let Some(bundle) = setup {
-                    let cmd = format!("topaz setup '{bundle}' --start");
-                    let dest = clipboard::copy_text(&cmd);
-                    app.set_toast(true, format!("Copied setup command to {dest}"));
-                }
-            }
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
-                app.modal = None;
-            }
-            _ => {}
-        },
-        Modal::RevokeConfirm { device_id, name } => match key.code {
-            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                app.modal = None;
-            }
-            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                app.modal = None;
-                spawn_revoke(data_dir.to_path_buf(), device_id, name, ev_tx.clone());
-            }
-            _ => {}
-        },
-    }
-}
-
-pub(super) fn filtered_palette(query: &str) -> Vec<&'static (&'static str, &'static str, PaletteAction)> {
-    let q = query.trim().to_ascii_lowercase();
-    PALETTE_ITEMS
-        .iter()
-        .filter(|(label, desc, _)| {
-            q.is_empty()
-                || label.to_ascii_lowercase().contains(&q)
-                || desc.to_ascii_lowercase().contains(&q)
-        })
-        .collect()
-}
-
-fn open_palette(app: &mut AppState) {
-    app.modal = Some(Modal::Palette {
-        query: String::new(),
-        selected: 0,
-    });
-}
-
-fn start_pairing(app: &mut AppState, data_dir: &Path, ev_tx: &mpsc::UnboundedSender<UiEvent>) {
-    app.modal = Some(Modal::Pairing {
-        code: None,
-        setup: None,
-        state: PairingState::Starting,
-    });
-    spawn_add_device(data_dir.to_path_buf(), ev_tx.clone());
-}
-
-fn copy_selected_peer(app: &mut AppState) {
-    let Some(peer) = app.selected_peer() else {
-        app.set_toast(false, "No peer selected");
-        return;
-    };
-    let text = peer
-        .dns_name
-        .as_deref()
-        .map(|d| format!("{d}.topaz"))
-        .or_else(|| peer.virtual_ip.clone())
-        .unwrap_or_else(|| peer.device_id.clone());
-    let dest = clipboard::copy_text(&text);
-    app.set_toast(true, format!("Copied {text} to {dest}"));
-}
-
-fn prompt_revoke_selected(app: &mut AppState) {
-    if let Some(peer) = app.selected_peer() {
-        app.modal = Some(Modal::RevokeConfirm {
-            device_id: peer.device_id,
-            name: peer.name,
-        });
-    } else {
-        app.set_toast(false, "No peer selected to revoke");
-    }
-}
-
-fn run_palette_action(
-    app: &mut AppState,
-    action: PaletteAction,
-    data_dir: &Path,
-    ev_tx: &mpsc::UnboundedSender<UiEvent>,
-) {
-    match action {
-        PaletteAction::KickAnnounce => spawn_kick(data_dir.to_path_buf(), true, ev_tx.clone()),
-        PaletteAction::KickLocal => spawn_kick(data_dir.to_path_buf(), false, ev_tx.clone()),
-        PaletteAction::AddDevice => start_pairing(app, data_dir, ev_tx),
-        PaletteAction::CopyPeerAddr => copy_selected_peer(app),
-        PaletteAction::RevokeSelected => prompt_revoke_selected(app),
-        PaletteAction::Refresh => {
-            spawn_refresh_devices(data_dir.to_path_buf(), ev_tx.clone());
-            app.set_toast(true, "Refreshing device list…");
-        }
-        PaletteAction::ToggleSidebar => {
-            app.sidebar_visible = !app.sidebar_visible;
-            app.save_prefs(data_dir);
-        }
-        PaletteAction::CycleTheme => {
-            app.theme = app.theme.cycle();
-            app.save_prefs(data_dir);
-            app.set_toast(true, format!("Theme: {}", app.theme.label()));
-        }
-        PaletteAction::ClearFilter => {
-            app.input.clear();
-            app.reconcile_selection();
-        }
-        PaletteAction::StopDaemon => spawn_stop_daemon(data_dir.to_path_buf(), ev_tx.clone()),
-        PaletteAction::Quit => app.should_quit = true,
-    }
-}
-
-fn execute_input_command(
-    app: &mut AppState,
-    cmd: InputCommand,
-    data_dir: &Path,
-    ev_tx: &mpsc::UnboundedSender<UiEvent>,
-) {
-    match cmd {
-        InputCommand::Kick { announce } => {
-            spawn_kick(data_dir.to_path_buf(), announce, ev_tx.clone())
-        }
-        InputCommand::Add => start_pairing(app, data_dir, ev_tx),
-        InputCommand::Revoke { target } => {
-            if let Some(t) = target {
-                let peers = merge_peers(&app.status, &app.devices, "");
-                let found = peers.into_iter().find(|p| {
-                    p.device_id == t
-                        || p.name.eq_ignore_ascii_case(&t)
-                        || p.dns_name
-                            .as_deref()
-                            .is_some_and(|d| d.eq_ignore_ascii_case(&t))
-                });
-                if let Some(p) = found {
-                    app.modal = Some(Modal::RevokeConfirm {
-                        device_id: p.device_id,
-                        name: p.name,
-                    });
-                } else {
-                    app.set_toast(false, format!("Device not found: {t}"));
-                }
-            } else {
-                prompt_revoke_selected(app);
-            }
-        }
-        InputCommand::Copy => copy_selected_peer(app),
-        InputCommand::Refresh => {
-            spawn_refresh_devices(data_dir.to_path_buf(), ev_tx.clone());
-            app.set_toast(true, "Refreshing device list…");
-        }
-        InputCommand::ToggleSidebar => {
-            app.sidebar_visible = !app.sidebar_visible;
-            app.save_prefs(data_dir);
-        }
-        InputCommand::Theme { name } => {
-            app.theme = match name {
-                Some(n) => ThemeKind::from_name(&n),
-                None => app.theme.cycle(),
-            };
-            app.save_prefs(data_dir);
-            app.set_toast(true, format!("Theme: {}", app.theme.label()));
-        }
-        InputCommand::StopDaemon => spawn_stop_daemon(data_dir.to_path_buf(), ev_tx.clone()),
-        InputCommand::Quit => app.should_quit = true,
-        InputCommand::Help => {
-            app.set_toast(
-                true,
-                "Commands: :kick [local] · :add · :revoke [peer] · :copy · :theme · :stop · :quit",
-            );
+        tokio::select! {
+            _ = shutdown.changed() => return,
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
         }
     }
 }
@@ -1147,63 +466,80 @@ fn execute_input_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ops::DeviceRow;
     use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::Terminal;
+    use state::{
+        merge_peers, AppMode, FocusArea, HitTarget, LocalServiceSnapshot, OnboardingChoice,
+        PeerServiceSnapshot, PeerSnapshot, TunSnapshot,
+    };
 
-    #[test]
-    fn parses_bottom_input_commands() {
-        assert_eq!(
-            parse_input_command(":kick"),
-            Ok(InputCommand::Kick { announce: true })
-        );
-        assert_eq!(
-            parse_input_command(":kick local"),
-            Ok(InputCommand::Kick { announce: false })
-        );
-        assert_eq!(parse_input_command(":add"), Ok(InputCommand::Add));
-        assert_eq!(parse_input_command(":copy"), Ok(InputCommand::Copy));
-        assert_eq!(parse_input_command(":stop"), Ok(InputCommand::StopDaemon));
-        assert_eq!(
-            parse_input_command(":revoke laptop"),
-            Ok(InputCommand::Revoke {
-                target: Some("laptop".into())
-            })
-        );
-        assert_eq!(
-            parse_input_command(":theme tokyonight"),
-            Ok(InputCommand::Theme {
-                name: Some("tokyonight".into())
-            })
-        );
-        assert_eq!(parse_input_command(":q"), Ok(InputCommand::Quit));
-        assert!(parse_input_command(":bogus").is_err());
+    fn render_string(app: &mut AppState, w: u16, h: u16) -> String {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| view::draw_ui(f, app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
     }
 
-    #[test]
-    fn merges_live_peers_and_offline_devices_with_filter() {
-        let status = StatusSnapshot {
-            account: "acct".into(),
-            device_id: "me".into(),
+    fn sample_live_app(kind: ThemeKind) -> AppState {
+        let local = LocalSnapshot {
+            device_id: "me11223344556677".into(),
+            device_name: "workstation".into(),
+            account_user_id: Some("acct_test".into()),
+            coord_url: "https://1.2.3.4:7722".into(),
+            uptime_s: Some(3725),
+            service_status: "systemd installed=true active=active".into(),
+            ..Default::default()
+        };
+
+        let mut app = AppState::new(kind, &prefs::ConsolePrefs::default(), local);
+        app.ws_connected = true;
+        app.status = StatusSnapshot {
+            account: "acct_test".into(),
+            device_id: "me11223344556677".into(),
             device_name: "workstation".into(),
             dns_name: Some("workstation".into()),
             virtual_ip: Some("100.64.0.1".into()),
+            tun: TunSnapshot {
+                enabled: true,
+                interface: Some("topaz0".into()),
+                cidr: "100.64.0.0/10".into(),
+                mtu: 1280,
+                dns_listen: Some("100.64.0.1:53".into()),
+                error: None,
+            },
+            connection: Some("direct".into()),
             peers: vec![PeerSnapshot {
-                device_id: "p1".into(),
-                name: "laptop".into(),
-                dns_name: Some("laptop".into()),
+                device_id: "p1aabbccddeeff00".into(),
+                name: "macbook".into(),
+                dns_name: Some("macbook".into()),
                 virtual_ip: Some("100.64.0.2".into()),
                 path: Some("direct".into()),
-                rtt_ms: Some(12),
+                rtt_ms: Some(9),
                 services: vec![PeerServiceSnapshot {
                     service_id: 16,
                     name: "jade".into(),
                 }],
             }],
-            ..Default::default()
+            services: vec![LocalServiceSnapshot {
+                service_id: 16,
+                name: "jade".into(),
+                online: true,
+                listeners: 2,
+            }],
         };
-        let devices = vec![
+        app.devices = vec![
             DeviceRow {
-                device_id: "me".into(),
+                device_id: "me11223344556677".into(),
                 name: "workstation".into(),
                 dns_name: Some("workstation".into()),
                 virtual_ip: Some("100.64.0.1".into()),
@@ -1212,95 +548,346 @@ mod tests {
                 me: true,
             },
             DeviceRow {
-                device_id: "p1".into(),
-                name: "laptop".into(),
-                dns_name: Some("laptop".into()),
+                device_id: "p1aabbccddeeff00".into(),
+                name: "macbook".into(),
+                dns_name: Some("macbook".into()),
                 virtual_ip: Some("100.64.0.2".into()),
                 status: "active".into(),
-                issuer: "me".into(),
+                issuer: "me11223344556677".into(),
                 me: false,
             },
             DeviceRow {
-                device_id: "p2".into(),
+                device_id: "p299887766554433".into(),
                 name: "nas".into(),
                 dns_name: Some("nas".into()),
                 virtual_ip: Some("100.64.0.3".into()),
                 status: "active".into(),
-                issuer: "me".into(),
+                issuer: "me11223344556677".into(),
                 me: false,
             },
         ];
-
-        let all = merge_peers(&status, &devices, "");
-        assert_eq!(all.len(), 2);
-        assert_eq!(all[0].device_id, "p1");
-        assert_eq!(all[0].services.len(), 1);
-        assert_eq!(all[1].device_id, "p2");
-        assert_eq!(all[1].path, None);
-
-        let by_plugin = merge_peers(&status, &devices, "jade");
-        assert_eq!(by_plugin.len(), 1);
-        assert_eq!(by_plugin[0].device_id, "p1");
+        app.reconcile_selection();
+        app
     }
 
     #[test]
-    fn renders_jade_aligned_layout_across_all_themes() {
+    fn merges_live_peers_and_offline_devices_with_filter() {
+        let app = sample_live_app(ThemeKind::Ink);
+        let all = merge_peers(&app.status, &app.devices, "");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].name, "macbook");
+        assert_eq!(all[1].name, "nas");
+        assert_eq!(all[1].path, None);
+
+        let by_service = merge_peers(&app.status, &app.devices, "jade");
+        assert_eq!(by_service.len(), 1);
+        assert_eq!(by_service[0].name, "macbook");
+    }
+
+    #[test]
+    fn renders_onboarding_standby_and_live_across_all_themes() {
         for kind in [ThemeKind::Ink, ThemeKind::TokyoNight, ThemeKind::Light] {
-            let mut app = AppState::new(kind, true);
-            app.ws_connected = true;
-            app.status = StatusSnapshot {
-                account: "acct".into(),
-                device_id: "me".into(),
-                device_name: "workstation".into(),
-                dns_name: Some("workstation".into()),
-                virtual_ip: Some("100.64.0.1".into()),
-                tun: TunSnapshot {
-                    enabled: true,
-                    interface: Some("topaz0".into()),
-                    cidr: "100.64.0.0/10".into(),
-                    mtu: 1280,
-                    dns_listen: Some("100.64.0.1:53".into()),
-                },
-                connection: Some("direct".into()),
-                peers: vec![PeerSnapshot {
-                    device_id: "p1".into(),
-                    name: "macbook".into(),
-                    dns_name: Some("macbook".into()),
-                    virtual_ip: Some("100.64.0.2".into()),
-                    path: Some("direct".into()),
-                    rtt_ms: Some(9),
-                    services: vec![PeerServiceSnapshot {
-                        service_id: 16,
-                        name: "jade".into(),
-                    }],
-                }],
-                services: vec![LocalServiceSnapshot {
-                    service_id: 16,
-                    name: "jade".into(),
-                    online: true,
-                    listeners: 2,
-                }],
+            // 1. Onboarding mode (no account)
+            let local = LocalSnapshot {
+                device_id: "newdev1234567890".into(),
+                ..Default::default()
             };
-            app.reconcile_selection();
+            let mut ob = AppState::new(kind, &prefs::ConsolePrefs::default(), local);
+            assert_eq!(ob.mode(), AppMode::Onboarding);
+            let out_ob = render_string(&mut ob, 100, 30);
+            assert!(out_ob.contains("Pair with Phrase"));
+            assert!(out_ob.contains("Create New Account"));
+            assert!(ob
+                .hit_regions
+                .iter()
+                .any(|h| h.target == HitTarget::OnboardingPick(OnboardingChoice::JoinPhrase)));
 
-            let backend = TestBackend::new(110, 32);
-            let mut terminal = Terminal::new(backend).unwrap();
-            terminal.draw(|f| view::draw_ui(f, &app)).unwrap();
+            // 2. Standby mode (account exists, daemon stopped)
+            let mut st = sample_live_app(kind);
+            st.ws_connected = false;
+            st.status = StatusSnapshot::default();
+            assert_eq!(st.mode(), AppMode::Standby);
+            let out_st = render_string(&mut st, 110, 32);
+            assert!(out_st.contains("standby"));
+            assert!(out_st.contains("Start VPN (TUN)"));
 
-            let buf = terminal.backend().buffer();
-            let mut rendered = String::new();
-            for y in 0..buf.area.height {
-                for x in 0..buf.area.width {
-                    rendered.push_str(buf[(x, y)].symbol());
-                }
-                rendered.push('\n');
-            }
-            assert!(rendered.contains("topaz"));
-            assert!(rendered.contains("macbook"));
-            assert!(rendered.contains("[jade]"));
-            assert!(rendered.contains("100.64.0.2"));
-            assert!(rendered.contains("tun:on"));
-            assert!(rendered.contains(kind.label()));
+            // 3. Live mode (This Device + Peer detail + offline peer shows `offline` not `active`)
+            let mut live = sample_live_app(kind);
+            assert_eq!(live.mode(), AppMode::Live);
+            let out_self = render_string(&mut live, 110, 32);
+            assert!(out_self.contains("topaz0"));
+            assert!(out_self.contains("100.64.0.1"));
+            assert!(out_self.contains("offline"));
+
+            // Select peer `macbook`
+            live.select_sidebar_index(1);
+            let out_peer = render_string(&mut live, 110, 32);
+            assert!(out_peer.contains("macbook"));
+            assert!(out_peer.contains("DIRECT"));
+            assert!(out_peer.contains("100.64.0.2"));
+            assert!(out_peer.contains("jade"));
+            // Verify internal debug jargon was removed
+            assert!(!out_peer.contains("service 4 discovery"));
+            assert!(!out_peer.contains("ready via control.sock"));
         }
+    }
+
+    #[test]
+    fn surfaces_tun_error_instead_of_claiming_no_tun() {
+        let mut live = sample_live_app(ThemeKind::Ink);
+        live.status.tun.enabled = false;
+        live.status.tun.interface = None;
+        live.status.tun.error = Some("Operation not permitted (/dev/net/tun)".into());
+        let out = render_string(&mut live, 110, 32);
+        assert!(out.contains("TUN err"));
+        assert!(out.contains("Operation not permitted"));
+    }
+
+    #[tokio::test]
+    async fn modern_keyboard_and_mouse_interactions_work() {
+        let mut app = sample_live_app(ThemeKind::Ink);
+        let dir = std::env::temp_dir().join("topaz-tui-test-dir");
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        // Render once so hit_regions are populated
+        let _ = render_string(&mut app, 110, 32);
+
+        // Mouse click on second row (peer `macbook`, sidebar idx 1)
+        let peer_region = app
+            .hit_regions
+            .iter()
+            .find(|h| h.target == HitTarget::SelectSidebarRow(1))
+            .expect("peer row hit region")
+            .rect;
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: peer_region.x + 1,
+            row: peer_region.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let up = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: peer_region.x + 1,
+            row: peer_region.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        mouse::handle_mouse(&mut app, down, &dir, &tx);
+        mouse::handle_mouse(&mut app, up, &dir, &tx);
+        assert_eq!(app.selected_idx, 1);
+
+        // Modern shortcut Ctrl+F opens inline filter
+        input::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            &dir,
+            &tx,
+        );
+        assert!(app.filter_open);
+        assert_eq!(app.focus, FocusArea::Filter);
+
+        // Paste into filter
+        input::handle_paste(&mut app, "nas");
+        assert_eq!(app.filter.value, "nas");
+        assert_eq!(app.filtered_peers().len(), 1);
+
+        // Esc clears filter
+        input::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &dir,
+            &tx,
+        );
+        assert!(!app.filter_open);
+        assert!(app.filter.value.is_empty());
+
+        // Ctrl+N opens unified Pair modal & renders cleanly
+        input::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            &dir,
+            &tx,
+        );
+        assert!(matches!(app.modal, Some(Modal::Pair(_))));
+        let pair_out = render_string(&mut app, 110, 32);
+        assert!(pair_out.contains("Phrase Pairing"));
+        assert!(pair_out.contains("Setup Bundle"));
+
+        // Sudo password modal renders masked password & command preview
+        app.modal = Some(Modal::SudoPrompt(SudoModal::new(&dir, false)));
+        input::handle_paste(&mut app, "secret123");
+        let sudo_out = render_string(&mut app, 110, 32);
+        assert!(sudo_out.contains("Administrator Password"));
+        assert!(sudo_out.contains("•••••••••"));
+        assert!(!sudo_out.contains("secret123"));
+
+        // Wrong sudo password keeps modal open, clears password, and displays inline error
+        handle_ui_event(
+            &mut app,
+            UiEvent::SudoResult(Err(ElevationError::IncorrectPassword)),
+            &dir,
+            &tx,
+        );
+        if let Some(Modal::SudoPrompt(ref s)) = app.modal {
+            assert!(s.password.value.is_empty());
+            assert!(s.error.as_deref().unwrap_or("").contains("Incorrect password"));
+        } else {
+            panic!("expected SudoPrompt to stay open on wrong password");
+        }
+        app.close_modal();
+    }
+
+    #[tokio::test]
+    async fn renders_all_modals_and_handles_narrow_layout_and_divider_drag() {
+        let mut app = sample_live_app(ThemeKind::TokyoNight);
+        let dir = std::env::temp_dir().join(format!("topaz-tui-modals-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        // 1. Narrow screen: starts in list view, click peer enters detail, click Back returns
+        let narrow_list = render_string(&mut app, 60, 22);
+        assert!(narrow_list.contains("Devices"));
+        assert!(narrow_list.contains("macbook"));
+        assert!(!app.narrow_showing_detail);
+
+        let peer_rect = app
+            .hit_regions
+            .iter()
+            .find(|h| h.target == HitTarget::SelectSidebarRow(1))
+            .expect("narrow peer row")
+            .rect;
+        mouse::handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: peer_rect.x + 1,
+                row: peer_rect.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            &dir,
+            &tx,
+        );
+        mouse::handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: peer_rect.x + 1,
+                row: peer_rect.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            &dir,
+            &tx,
+        );
+        assert!(app.narrow_showing_detail);
+        let narrow_detail = render_string(&mut app, 60, 22);
+        assert!(narrow_detail.contains("← Devices"));
+        assert!(narrow_detail.contains("macbook"));
+
+        // 2. Wide screen divider drag-resize
+        app.narrow_showing_detail = false;
+        let _ = render_string(&mut app, 110, 32);
+        let dx = app.divider.x.expect("divider x");
+        mouse::handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: dx,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+            &dir,
+            &tx,
+        );
+        assert!(app.divider.dragging);
+        mouse::handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 44,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+            &dir,
+            &tx,
+        );
+        mouse::handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 44,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+            &dir,
+            &tx,
+        );
+        assert!(!app.divider.dragging);
+        assert_eq!(app.divider.width_override, Some(44));
+
+        // 3. Interactive phrase pairing incoming approval
+        actions::open_pair_modal(&mut app);
+        let (d_tx, mut d_rx) = tokio::sync::oneshot::channel();
+        handle_ui_event(
+            &mut app,
+            UiEvent::PairPeerIncoming {
+                device_name: "ipad".into(),
+                device_id: "aa11bb22cc33dd44".into(),
+                sas: "482-917".into(),
+                decision_tx: d_tx,
+            },
+            &dir,
+            &tx,
+        );
+        let confirm_out = render_string(&mut app, 110, 32);
+        assert!(confirm_out.contains("Approve Device"));
+        assert!(confirm_out.contains("ipad"));
+        input::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &dir,
+            &tx,
+        );
+        assert_eq!(d_rx.try_recv(), Ok(true));
+        app.close_modal();
+
+        // 4. Doctor, Logs, Settings, Revoke, Palette, StopConfirm, Help modals all render cleanly
+        actions::open_doctor_modal(&mut app, &dir, &tx);
+        assert!(render_string(&mut app, 110, 32).contains("Network Doctor"));
+
+        actions::open_logs_modal(&mut app, &dir, &tx);
+        handle_ui_event(
+            &mut app,
+            UiEvent::LogsLoaded(vec![
+                "INFO topaz engine ready".into(),
+                "WARN relay fallback active".into(),
+                "ERROR tun open failed".into(),
+            ]),
+            &dir,
+            &tx,
+        );
+        let log_out = render_string(&mut app, 110, 32);
+        assert!(log_out.contains("Daemon Logs"));
+        assert!(log_out.contains("tun open failed"));
+
+        actions::open_settings_modal(&mut app, &dir, &tx);
+        let set_out = render_string(&mut app, 110, 32);
+        assert!(set_out.contains("Settings & Autostart"));
+        assert!(set_out.contains("Force Relay"));
+
+        app.close_modal();
+        app.select_sidebar_index(1);
+        actions::prompt_revoke_selected(&mut app);
+        let rev_out = render_string(&mut app, 110, 32);
+        assert!(rev_out.contains("Confirm Device Revocation"));
+
+        actions::open_palette(&mut app);
+        assert!(render_string(&mut app, 110, 32).contains("Command Palette"));
+
+        app.modal = Some(Modal::StopConfirm);
+        assert!(render_string(&mut app, 110, 32).contains("Stop Topaz Daemon"));
+
+        app.modal = Some(Modal::Help);
+        assert!(render_string(&mut app, 110, 32).contains("Keyboard & Mouse Shortcuts"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

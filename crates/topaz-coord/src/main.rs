@@ -16,7 +16,11 @@ use tls::ServerTls;
 use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
-#[command(name = "topaz-coord", about = "Topaz coordination and relay server")]
+#[command(
+    name = "topaz-coord",
+    version = topaz_proto::VERSION_LONG,
+    about = "Topaz coordination and relay server"
+)]
 struct Args {
     /// HTTPS + WSS listen address (control plane).
     #[arg(long, default_value = "0.0.0.0:7722", env = "COORD_LISTEN")]
@@ -36,6 +40,15 @@ struct Args {
     /// on the control-plane port, or on `--relay-ws-listen` if that bind succeeded.
     #[arg(long, env = "COORD_RELAY_WS_ADVERTISE")]
     relay_ws_advertise: Option<String>,
+    /// UDP/QUIC unreliable datagram relay listen address (avoids TCP-over-TCP for VPN).
+    #[arg(long, default_value = "0.0.0.0:7724", env = "COORD_RELAY_QUIC_LISTEN")]
+    relay_quic_listen: SocketAddr,
+    /// Advertised QUIC datagram relay `host:port`. Defaults to request's Host + port.
+    #[arg(long, env = "COORD_RELAY_QUIC_ADVERTISE")]
+    relay_quic_advertise: Option<String>,
+    /// Turn the UDP/QUIC datagram relay off.
+    #[arg(long)]
+    relay_quic_disable: bool,
     /// STUN (UDP, RFC 5389 BINDING) listen address for NAT traversal.
     #[arg(long, default_value = "0.0.0.0:3478", env = "COORD_STUN_LISTEN")]
     stun_listen: SocketAddr,
@@ -75,6 +88,12 @@ enum Cmd {
     Fingerprint,
     /// Relay bytes per account per day.
     Usage,
+    /// Print binary and protocol version details.
+    Version {
+        /// Output version details as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -98,6 +117,15 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    if let Some(Cmd::Version { json }) = &args.cmd {
+        let ver = topaz_proto::ServerVersion::current();
+        if *json {
+            println!("{}", serde_json::to_string_pretty(&ver)?);
+        } else {
+            println!("topaz-coord {}", ver.display_line());
+        }
+        return Ok(());
+    }
     let db = Db::open(&args.db)?;
     let server_tls = ServerTls::from_seed(db.server_key_seed()?)?;
 
@@ -136,6 +164,7 @@ async fn main() -> Result<()> {
             }
             return Ok(());
         }
+        Some(Cmd::Version { .. }) => unreachable!("handled before DB open"),
         None => {}
     }
 
@@ -146,12 +175,45 @@ async fn main() -> Result<()> {
         args.relay_ws_advertise.clone(),
         args.listen.port(),
     ));
+    {
+        let janitor_state = state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                janitor_state.purge_stale();
+            }
+        });
+    }
 
     let limits = relay::Limits {
         bytes_per_sec: args.relay_mbps_per_account * 1_000_000 / 8,
         sessions: args.relay_sessions_per_account,
     };
     let relay = relay::start(args.relay_listen, state.clone(), limits).await?;
+
+    if args.relay_quic_disable {
+        info!("quic datagram relay disabled");
+    } else {
+        match server_tls.quic_relay_server_config() {
+            Ok(quic_cfg) => match relay
+                .listen_quic_datagram(args.relay_quic_listen, quic_cfg)
+                .await
+            {
+                Ok(bound) => {
+                    state.set_relay_quic(args.relay_quic_advertise.clone(), bound.port());
+                }
+                Err(e) => {
+                    warn!(error = %e, addr = %args.relay_quic_listen, "quic datagram relay bind failed; disabled");
+                }
+            },
+            Err(e) => {
+                warn!(error = %e, "quic datagram relay tls config failed; disabled");
+            }
+        }
+    }
 
     if args.stun_disable {
         info!("stun disabled");
@@ -190,6 +252,7 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     let app = api::router(state, relay.clone());
     info!(
+        version = topaz_proto::VERSION_LONG,
         addr = %args.listen,
         relay = %args.relay_listen,
         relay_ws = "/v1/relay",

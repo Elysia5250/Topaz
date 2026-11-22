@@ -102,6 +102,8 @@ pub async fn configure_system_dns(tun_name: &str, listen_addr: SocketAddr) -> Sy
     #[cfg(target_os = "macos")]
     {
         let _ = tun_name;
+        // Remove any stale resolver file left behind by an unclean crash.
+        let _ = std::fs::remove_file("/etc/resolver/topaz");
         let written = match std::fs::create_dir_all("/etc/resolver") {
             Ok(()) => {
                 let body = format!(

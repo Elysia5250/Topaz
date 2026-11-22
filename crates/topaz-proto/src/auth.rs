@@ -10,11 +10,13 @@ use std::collections::HashSet;
 
 /// Maximum clock skew accepted for signed requests and relay hellos.
 pub const MAX_SKEW_SECS: u64 = 120;
+/// Maximum clock skew accepted for certificate/revocation `issued_at` at coord submission time.
+pub const MAX_CERT_CLOCK_SKEW_SECS: u64 = 300;
 
-pub const HDR_DEVICE: &str = "x-ss-device";
-pub const HDR_TIME: &str = "x-ss-time";
-pub const HDR_NONCE: &str = "x-ss-nonce";
-pub const HDR_SIG: &str = "x-ss-sig";
+pub const HDR_DEVICE: &str = "x-topaz-device";
+pub const HDR_TIME: &str = "x-topaz-time";
+pub const HDR_NONCE: &str = "x-topaz-nonce";
+pub const HDR_SIG: &str = "x-topaz-sig";
 
 /// Short id derived from a public key: first 8 bytes of blake3, hex.
 pub fn derive_id(pubkey: &[u8; 32]) -> String {
@@ -237,7 +239,7 @@ impl DeviceSet {
         self.active.iter().find(|c| c.device_id == device_id)
     }
 
-    /// Keys allowed to sign new certs or revocations: root plus active devices.
+    /// Keys allowed to sign new certs: root plus active devices.
     pub fn authority_keys(&self, user_pubkey: &str) -> HashSet<String> {
         let mut keys: HashSet<String> = self
             .active
@@ -247,118 +249,162 @@ impl DeviceSet {
         keys.insert(user_pubkey.to_string());
         keys
     }
+
+    /// Whether `issuer_pubkey` is authorized to revoke `target_device_id`.
+    ///
+    /// Policy (1A): only the account root key, an active ancestor on the
+    /// target's certificate issuance chain, or the target device itself may
+    /// revoke the target. Siblings and descendants can never revoke peers or
+    /// parents.
+    pub fn can_revoke(
+        &self,
+        user_pubkey: &str,
+        issuer_pubkey: &str,
+        target_device_id: &str,
+    ) -> bool {
+        let Some(target) = self.active_by_id(target_device_id) else {
+            return false;
+        };
+        if issuer_pubkey == user_pubkey || issuer_pubkey == target.device_pubkey {
+            return true;
+        }
+        // Issuer must itself be an active device on the target's ancestor chain.
+        if !self.active.iter().any(|c| c.device_pubkey == issuer_pubkey) {
+            return false;
+        }
+        let by_pubkey: std::collections::HashMap<&str, &DeviceCert> = self
+            .valid
+            .iter()
+            .map(|c| (c.device_pubkey.as_str(), c))
+            .collect();
+        let mut cursor = target.issuer_pubkey.as_str();
+        for _ in 0..=self.valid.len() {
+            if cursor == issuer_pubkey {
+                return true;
+            }
+            if cursor == user_pubkey {
+                return false;
+            }
+            match by_pubkey.get(cursor) {
+                Some(parent) => cursor = parent.issuer_pubkey.as_str(),
+                None => return false,
+            }
+        }
+        false
+    }
 }
 
 pub fn evaluate(user_pubkey: &str, entries: &[DeviceEntry]) -> DeviceSet {
+    use std::collections::HashMap;
+
     let candidates: Vec<&DeviceEntry> = entries
         .iter()
-        .filter(|e| e.cert.user_pubkey == user_pubkey && e.cert.self_consistent())
+        .filter(|e| {
+            e.cert.user_pubkey == user_pubkey
+                && e.cert.device_pubkey != user_pubkey
+                && e.cert.device_pubkey != e.cert.issuer_pubkey
+                && e.cert.self_consistent()
+        })
         .collect();
 
-    // First collect every cert that chains to the root key.
-    let mut trusted_keys: HashSet<String> = HashSet::from([user_pubkey.to_string()]);
-    let mut all_chained: Vec<&DeviceEntry> = Vec::new();
+    // Build an acyclic issuance tree rooted at `user_pubkey` in BFS layers.
+    // Because each layer only expands from the previous layer, the parent
+    // relationship is strictly acyclic and every device has a unique ancestor
+    // chain to the root key.
+    let mut visited_ids: HashSet<&str> = HashSet::new();
+    let mut visited_keys: HashSet<&str> = HashSet::from([user_pubkey]);
+    let mut current_layer: HashSet<&str> = HashSet::from([user_pubkey]);
+    let mut layers: Vec<Vec<&DeviceEntry>> = Vec::new();
+    let mut parent_of: HashMap<&str, &str> = HashMap::new();
+
     loop {
-        let mut progressed = false;
+        let mut next_entries: Vec<&DeviceEntry> = Vec::new();
+        let mut next_keys: HashSet<&str> = HashSet::new();
         for e in &candidates {
-            if all_chained
-                .iter()
-                .any(|v| v.cert.device_id == e.cert.device_id)
-            {
+            let dev_id = e.cert.device_id.as_str();
+            let dev_pk = e.cert.device_pubkey.as_str();
+            let iss_pk = e.cert.issuer_pubkey.as_str();
+            if visited_ids.contains(dev_id) || visited_keys.contains(dev_pk) {
                 continue;
             }
-            if trusted_keys.contains(&e.cert.issuer_pubkey) {
-                trusted_keys.insert(e.cert.device_pubkey.clone());
-                all_chained.push(e);
-                progressed = true;
+            if current_layer.contains(iss_pk) {
+                visited_ids.insert(dev_id);
+                visited_keys.insert(dev_pk);
+                next_keys.insert(dev_pk);
+                parent_of.insert(dev_pk, iss_pk);
+                next_entries.push(e);
             }
         }
-        if !progressed {
+        if next_entries.is_empty() {
             break;
         }
+        layers.push(next_entries);
+        current_layer = next_keys;
     }
 
-    let valid_rev = |e: &DeviceEntry, authorities: &HashSet<String>| -> Option<u64> {
-        let r = e.revocation.as_ref()?;
-        if r.device_id == e.cert.device_id
-            && r.user_id == e.cert.user_id
-            && authorities.contains(&r.issuer_pubkey)
-            && verify(&r.issuer_pubkey, &r.signing_bytes(), &r.sig)
-        {
-            Some(r.issued_at)
-        } else {
-            None
-        }
-    };
+    // Evaluate validity and revocations strictly top-down by tree depth.
+    // When processing a device at depth k, the status of every strict ancestor
+    // (depths 0..k) is already finalized, so resolution is order-independent
+    // and immune to mutual-revocation cycles.
+    let mut valid_keys: HashSet<&str> = HashSet::from([user_pubkey]);
+    let mut revoked_at: HashMap<&str, u64> = HashMap::new();
+    let mut valid: Vec<DeviceCert> = Vec::new();
+    let mut active: Vec<DeviceCert> = Vec::new();
 
-    // Determine effective revocations starting from the root key so a device
-    // revoked by root cannot counter-revoke other active devices.
-    let mut revoked_at: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-    let root_only: HashSet<String> = HashSet::from([user_pubkey.to_string()]);
-    for e in &all_chained {
-        if let Some(ts) = valid_rev(e, &root_only) {
-            revoked_at.insert(e.cert.device_pubkey.clone(), ts);
-        }
-    }
-    loop {
-        let mut authorities: HashSet<String> = HashSet::from([user_pubkey.to_string()]);
-        for e in &all_chained {
-            if !revoked_at.contains_key(&e.cert.device_pubkey) {
-                authorities.insert(e.cert.device_pubkey.clone());
-            }
-        }
-        let mut progressed = false;
-        for e in &all_chained {
-            if revoked_at.contains_key(&e.cert.device_pubkey) {
+    for layer in &layers {
+        for e in layer {
+            let dev_pk = e.cert.device_pubkey.as_str();
+            let iss_pk = e.cert.issuer_pubkey.as_str();
+            if !valid_keys.contains(iss_pk) {
                 continue;
             }
-            if let Some(ts) = valid_rev(e, &authorities) {
-                revoked_at.insert(e.cert.device_pubkey.clone(), ts);
-                progressed = true;
-            }
-        }
-        if !progressed {
-            break;
-        }
-    }
-
-    // Re-evaluate the certificate chain while rejecting any cert issued by a
-    // device at or after its revocation timestamp.
-    let mut valid_keys: HashSet<String> = HashSet::from([user_pubkey.to_string()]);
-    let mut valid: Vec<&DeviceEntry> = Vec::new();
-    loop {
-        let mut progressed = false;
-        for e in &all_chained {
-            if valid.iter().any(|v| v.cert.device_id == e.cert.device_id) {
-                continue;
-            }
-            if !valid_keys.contains(&e.cert.issuer_pubkey) {
-                continue;
-            }
-            if let Some(&rev_ts) = revoked_at.get(&e.cert.issuer_pubkey) {
-                if e.cert.issued_at >= rev_ts {
+            if let Some(&parent_rev_ts) = revoked_at.get(iss_pk) {
+                if e.cert.issued_at >= parent_rev_ts {
                     continue;
                 }
             }
-            valid_keys.insert(e.cert.device_pubkey.clone());
-            valid.push(e);
-            progressed = true;
-        }
-        if !progressed {
-            break;
+            valid_keys.insert(dev_pk);
+            valid.push(e.cert.clone());
+
+            let is_revoked = e.revocation.as_ref().and_then(|r| {
+                if r.device_id != e.cert.device_id || r.user_id != e.cert.user_id {
+                    return None;
+                }
+                let rev_issuer = r.issuer_pubkey.as_str();
+                let authorized = if rev_issuer == user_pubkey || rev_issuer == dev_pk {
+                    true
+                } else {
+                    // Must be a currently-active (unrevoked) strict ancestor.
+                    let mut found = false;
+                    let mut cursor = iss_pk;
+                    while cursor != user_pubkey {
+                        if cursor == rev_issuer {
+                            found = !revoked_at.contains_key(rev_issuer);
+                            break;
+                        }
+                        match parent_of.get(cursor) {
+                            Some(&p) => cursor = p,
+                            None => break,
+                        }
+                    }
+                    found
+                };
+                if authorized && verify(&r.issuer_pubkey, &r.signing_bytes(), &r.sig) {
+                    Some(r.issued_at)
+                } else {
+                    None
+                }
+            });
+
+            if let Some(ts) = is_revoked {
+                revoked_at.insert(dev_pk, ts);
+            } else {
+                active.push(e.cert.clone());
+            }
         }
     }
 
-    let active = valid
-        .iter()
-        .filter(|e| !revoked_at.contains_key(&e.cert.device_pubkey))
-        .map(|e| e.cert.clone())
-        .collect();
-
-    DeviceSet {
-        valid: valid.iter().map(|e| e.cert.clone()).collect(),
-        active,
-    }
+    DeviceSet { valid, active }
 }
 
 pub fn request_signing_bytes(
@@ -518,5 +564,76 @@ mod tests {
         assert!(!set.is_active(&ca.device_id));
         assert!(set.is_active(&cb.device_id), "revoked A must not revoke active B");
         assert!(!set.is_active(&cc.device_id), "post-revocation cert by A must be rejected");
+    }
+
+    #[test]
+    fn sibling_and_child_cannot_revoke_peer_or_parent() {
+        let root = key(1);
+        let a = key(2);
+        let b = key(3);
+        let c = key(4);
+        let ca = cert(&root, &a, &root);
+        let cb = cert(&root, &b, &root);
+        let cc = cert(&root, &c, &a);
+
+        // Sibling A tries to revoke sibling B, and child C tries to revoke parent A.
+        let rev_b_by_a = revoke(&root, &cb, &a);
+        let rev_a_by_c = revoke(&root, &ca, &c);
+        let entries = vec![
+            DeviceEntry::new(ca.clone(), Some(rev_a_by_c)),
+            DeviceEntry::new(cb.clone(), Some(rev_b_by_a)),
+            DeviceEntry::new(cc.clone(), None),
+        ];
+        let set = evaluate(&pk_hex(&root), &entries);
+        assert!(set.is_active(&ca.device_id), "child must not revoke parent");
+        assert!(set.is_active(&cb.device_id), "sibling must not revoke sibling");
+        assert!(set.is_active(&cc.device_id));
+        assert!(!set.can_revoke(&pk_hex(&root), &pk_hex(&a), &cb.device_id));
+        assert!(!set.can_revoke(&pk_hex(&root), &pk_hex(&c), &ca.device_id));
+        assert!(set.can_revoke(&pk_hex(&root), &pk_hex(&a), &cc.device_id));
+        assert!(set.can_revoke(&pk_hex(&root), &pk_hex(&root), &ca.device_id));
+        assert!(set.can_revoke(&pk_hex(&root), &pk_hex(&c), &cc.device_id));
+    }
+
+    #[test]
+    fn grandparent_and_self_can_revoke() {
+        let root = key(1);
+        let a = key(2);
+        let b = key(3);
+        let c = key(4);
+        let ca = cert(&root, &a, &root);
+        let cb = cert(&root, &b, &a);
+        let cc = cert(&root, &c, &b);
+
+        // Grandparent A revokes C; B self-revokes.
+        let entries = vec![
+            DeviceEntry::new(ca.clone(), None),
+            DeviceEntry::new(cb.clone(), Some(revoke(&root, &cb, &b))),
+            DeviceEntry::new(cc.clone(), Some(revoke(&root, &cc, &a))),
+        ];
+        let set = evaluate(&pk_hex(&root), &entries);
+        assert!(set.is_active(&ca.device_id));
+        assert!(!set.is_active(&cb.device_id), "self-revocation should take effect");
+        assert!(!set.is_active(&cc.device_id), "active grandparent should revoke descendant");
+    }
+
+    #[test]
+    fn revoked_ancestor_loses_revocation_authority_over_descendant() {
+        let root = key(1);
+        let a = key(2);
+        let b = key(3);
+        let ca = cert(&root, &a, &root);
+        let cb = cert(&root, &b, &a);
+        // Root revokes A; A had also tried to revoke B.
+        let entries = vec![
+            DeviceEntry::new(ca.clone(), Some(revoke(&root, &ca, &root))),
+            DeviceEntry::new(cb.clone(), Some(revoke(&root, &cb, &a))),
+        ];
+        let set = evaluate(&pk_hex(&root), &entries);
+        assert!(!set.is_active(&ca.device_id));
+        assert!(
+            set.is_active(&cb.device_id),
+            "revocation by a root-revoked ancestor must not hold B revoked"
+        );
     }
 }

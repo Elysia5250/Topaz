@@ -13,9 +13,12 @@ pub mod stun;
 mod tls;
 
 pub use codec::{read_framed, write_framed};
-pub use coord::CoordClient;
+pub use coord::{CoordClient, CoordError};
 pub use endpoints::{collect_local_endpoints, is_advertisable_ip};
-pub use enroll::{approve_new_device, approve_with_secret, join_with_code, join_with_secret};
+pub use enroll::{
+    approve_new_device, approve_with_secret, derive_sas, join_with_code, join_with_secret,
+    join_with_secret_with_sas, normalize_secret, wait_secret_pair_request, PendingSecretApproval,
+};
 pub use mux::{Channel, DynamicServices, Multiplexer, MuxRole, OnStream};
 pub use quic::{QuicEndpoint, QuicLink, QuicStream};
 pub use relay::RelayAddrs;

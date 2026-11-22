@@ -61,6 +61,19 @@ pub async fn spawn_detached(
     enable_mdns: bool,
     vpn_cfg: VpnConfig,
 ) -> Result<()> {
+    let msg = spawn_detached_quiet(data_dir, coord_url, force_relay, enable_mdns, vpn_cfg).await?;
+    println!("{msg}");
+    Ok(())
+}
+
+/// Spawn a detached background daemon without writing to stdout/stderr (safe for TUI callers).
+pub async fn spawn_detached_quiet(
+    data_dir: PathBuf,
+    coord_url: Option<String>,
+    force_relay: bool,
+    enable_mdns: bool,
+    vpn_cfg: VpnConfig,
+) -> Result<String> {
     if crate::client::ControlClient::try_daemon(&data_dir)
         .await
         .is_some()
@@ -74,12 +87,7 @@ pub async fn spawn_detached(
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("create data dir {}", data_dir.display()))?;
     let log_path = data_dir.join("topaz.log");
-    let log_out = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .with_context(|| format!("open log file {}", log_path.display()))?;
-    topaz_core::chown_to_sudo_user(&log_path);
+    let log_out = open_log_file(&log_path)?;
     let log_err = log_out
         .try_clone()
         .context("clone log file handle for stderr")?;
@@ -132,20 +140,224 @@ pub async fn spawn_detached(
             .await
             .is_some()
         {
-            println!("topaz daemon started (pid {pid}, log {})", log_path.display());
-            return Ok(());
+            return Ok(format!(
+                "topaz daemon started (pid {pid}, log {})",
+                log_path.display()
+            ));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    println!(
+    Ok(format!(
         "topaz daemon spawned (pid {pid}, log {}); control socket still initializing",
         log_path.display()
-    );
-    Ok(())
+    ))
 }
 
-fn read_log_tail(path: &Path, max_lines: usize) -> String {
+/// Cleanly request daemon shutdown over control.sock and wait up to 5 seconds.
+/// Returns `Ok(true)` if a running daemon stopped, `Ok(false)` if none was running.
+pub async fn stop_daemon_quiet(data_dir: &Path) -> Result<bool> {
+    let Some(daemon) = crate::client::ControlClient::try_daemon(data_dir).await else {
+        return Ok(false);
+    };
+    let _ = daemon.post("/v1/shutdown", None).await;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if crate::client::ControlClient::try_daemon(data_dir)
+            .await
+            .is_none()
+        {
+            return Ok(true);
+        }
+    }
+    bail!("daemon did not exit within 5 seconds")
+}
+
+/// Whether the current process already runs with root privileges.
+pub fn is_elevated() -> bool {
+    #[cfg(unix)]
+    {
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// Check if `sudo` can execute without prompting for a password (cached timestamp or NOPASSWD).
+pub async fn sudo_cached() -> bool {
+    if is_elevated() {
+        return true;
+    }
+    let fut = tokio::process::Command::new("sudo")
+        .args(["-n", "true"])
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    matches!(
+        tokio::time::timeout(Duration::from_secs(2), fut).await,
+        Ok(Ok(s)) if s.success()
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ElevationError {
+    PasswordRequired,
+    IncorrectPassword,
+    Failed(String),
+}
+
+impl std::fmt::Display for ElevationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PasswordRequired => write!(f, "administrator password required"),
+            Self::IncorrectPassword => write!(f, "incorrect password, please try again"),
+            Self::Failed(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+/// Start a detached TUN daemon, using `sudo` when not already root.
+/// If `password` is `Some`, it is piped to `sudo -S -p ""` and zeroed immediately afterward.
+pub async fn spawn_detached_elevated(
+    data_dir: PathBuf,
+    force_relay: bool,
+    enable_mdns: bool,
+    vpn_cfg: VpnConfig,
+    mut password: Option<String>,
+) -> std::result::Result<String, ElevationError> {
+    if is_elevated() || vpn_cfg.disabled {
+        zeroize_opt_string(&mut password);
+        return spawn_detached_quiet(data_dir, None, force_relay, enable_mdns, vpn_cfg)
+            .await
+            .map_err(|e| ElevationError::Failed(e.to_string()));
+    }
+
+    let exe = std::env::current_exe()
+        .map_err(|e| ElevationError::Failed(format!("locate executable: {e}")))?;
+    let mut run_args = build_run_args(&data_dir, None, force_relay, enable_mdns, &vpn_cfg);
+    run_args.push(OsString::from("--detach"));
+
+    let mut cmd = tokio::process::Command::new("sudo");
+    cmd.env("LC_ALL", "C");
+    if password.is_some() {
+        cmd.args(["-S", "-p", "", "--"]);
+    } else {
+        cmd.args(["-n", "--"]);
+    }
+    cmd.arg(&exe)
+        .args(&run_args)
+        .stdin(if password.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            zeroize_opt_string(&mut password);
+            return Err(ElevationError::Failed(format!(
+                "failed to launch sudo ({e}); try No-TUN mode or run `sudo topaz run --detach`"
+            )));
+        }
+    };
+
+    if let Some(mut pw) = password.take() {
+        use tokio::io::AsyncWriteExt;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(pw.as_bytes()).await;
+            let _ = stdin.write_all(b"\n").await;
+            let _ = stdin.flush().await;
+            drop(stdin);
+        }
+        zeroize_string(&mut pw);
+    }
+
+    let output = match tokio::time::timeout(Duration::from_secs(20), child.wait_with_output()).await
+    {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            return Err(ElevationError::Failed(format!("sudo wait failed: {e}")));
+        }
+        Err(_) => {
+            return Err(ElevationError::Failed(
+                "timed out waiting for sudo to start the daemon".into(),
+            ));
+        }
+    };
+
+    if output.status.success() {
+        let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if out.is_empty() {
+            Ok("VPN TUN daemon started".into())
+        } else {
+            Ok(out)
+        }
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let lower = stderr.to_ascii_lowercase();
+        if lower.contains("a password is required") {
+            Err(ElevationError::PasswordRequired)
+        } else if lower.contains("incorrect password")
+            || lower.contains("sorry, try again")
+            || lower.contains("authentication failure")
+        {
+            Err(ElevationError::IncorrectPassword)
+        } else if !stderr.is_empty() {
+            Err(ElevationError::Failed(stderr))
+        } else {
+            Err(ElevationError::Failed(format!(
+                "sudo exited with status {}",
+                output.status
+            )))
+        }
+    }
+}
+
+fn open_log_file(log_path: &Path) -> Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+        let f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(log_path)
+            .with_context(|| format!("open log file {}", log_path.display()))?;
+        topaz_core::chown_fd_to_sudo_user(f.as_raw_fd());
+        Ok(f)
+    }
+    #[cfg(not(unix))]
+    {
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .with_context(|| format!("open log file {}", log_path.display()))
+    }
+}
+
+fn zeroize_string(s: &mut String) {
+    use zeroize::Zeroize;
+    s.zeroize();
+}
+
+fn zeroize_opt_string(opt: &mut Option<String>) {
+    if let Some(s) = opt.as_mut() {
+        zeroize_string(s);
+    }
+    *opt = None;
+}
+
+pub fn read_log_tail(path: &Path, max_lines: usize) -> String {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return String::new();
     };
@@ -183,64 +395,108 @@ pub async fn cmd_run(
     let (url, pin) = store.require_coord()?;
     let coord = CoordClient::new(url, pin)?.with_identity(store.identity.clone());
     let trust = new_trust_store();
-    match coord.list_devices().await {
-        Ok(entries) => {
-            let set = evaluate(&account.user_pubkey, &entries);
-            let mut t = trust.write().unwrap();
-            for c in &set.active {
-                if c.device_id != store.identity.device_id {
-                    if let Some(pk) = parse_pubkey(&c.device_pubkey) {
-                        t.insert(pk, c.device_id.clone());
-                    }
+    let initial_devices = match tokio::time::timeout(Duration::from_secs(5), coord.list_devices())
+        .await
+    {
+        Ok(Ok(entries)) => {
+            let _ = store.save_devices_cache(&entries);
+            entries
+        }
+        Ok(Err(e)) => {
+            warn!(error = %e, "trust store priming from coord failed; loading cached device list");
+            store.load_devices_cache()
+        }
+        Err(_) => {
+            warn!("trust store priming timed out; loading cached device list");
+            store.load_devices_cache()
+        }
+    };
+    if !initial_devices.is_empty() {
+        let set = evaluate(&account.user_pubkey, &initial_devices);
+        let mut t = trust.write().unwrap();
+        for c in &set.active {
+            if c.device_id != store.identity.device_id {
+                if let Some(pk) = parse_pubkey(&c.device_pubkey) {
+                    t.insert(pk, c.device_id.clone());
                 }
             }
         }
-        Err(e) => warn!(error = %e, "trust store priming failed; first refresh retries"),
     }
 
-    let (mut quic, mut mapped) = QuicEndpoint::bind(&store.identity, &trust, None)?;
+    let (quic, _) = QuicEndpoint::bind(&store.identity, &trust, None)?;
     info!(addr = %quic.local_addr, "QUIC endpoint bound");
     let mut endpoints = collect_local_endpoints(quic.local_addr.port(), None);
-    let reg = coord.register(endpoints.clone()).await?;
-    let with_observed =
-        collect_local_endpoints(quic.local_addr.port(), Some(reg.observed_ip.as_str()));
-    let mut reg = if with_observed != endpoints {
-        endpoints = with_observed;
-        coord.register(endpoints.clone()).await?
-    } else {
-        reg
+    let initial_reg = match tokio::time::timeout(
+        Duration::from_secs(5),
+        coord.register(endpoints.clone()),
+    )
+    .await
+    {
+        Ok(Ok(r)) => Some(r),
+        Ok(Err(e)) => {
+            warn!(error = %e, "initial coord register failed; continuing in offline/mDNS mode until coord returns");
+            None
+        }
+        Err(_) => {
+            warn!("initial coord register timed out; continuing in offline/mDNS mode until coord returns");
+            None
+        }
     };
 
-    if mapped.is_none() {
+    let relay = if let Some(mut reg) = initial_reg {
+        let mut updated =
+            collect_local_endpoints(quic.local_addr.port(), Some(reg.observed_ip.as_str()));
+        // Live async STUN probe on the SAME QUIC socket (no socket recreation or thread blocking).
         if let Ok(stun_addr) = resolve_stun(&reg.stun).await {
-            drop(quic);
-            let (q, m) = QuicEndpoint::bind(&store.identity, &trust, Some(stun_addr))?;
-            quic = q;
-            mapped = m;
-            endpoints =
-                collect_local_endpoints(quic.local_addr.port(), Some(reg.observed_ip.as_str()));
-            if let Some(mapped) = mapped {
-                let s = mapped.to_string();
-                if !endpoints.contains(&s) {
-                    endpoints.push(s);
+            match quic.probe_stun(stun_addr).await {
+                Ok(mapped) => {
+                    info!(%stun_addr, %mapped, "stun mapped on live QUIC socket");
+                    let s = mapped.to_string();
+                    if !updated.contains(&s) {
+                        updated.push(s);
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, %stun_addr, "initial live stun probe failed");
                 }
             }
-            reg = coord.register(endpoints.clone()).await?;
         }
-    }
-    let relay = RelayAddrs {
-        tcp: coord.relay_addr(&reg),
-        ws: coord.relay_ws_url(&reg),
-        coord_tls: coord.tls_config(),
+        if updated != endpoints {
+            endpoints = updated;
+            reg = coord.register(endpoints.clone()).await.unwrap_or(reg);
+        }
+        let relay = RelayAddrs {
+            tcp: coord.relay_addr(&reg),
+            ws: coord.relay_ws_url(&reg),
+            quic: coord.relay_quic_addr(&reg),
+            coord_tls: coord.tls_config(),
+            coord_quic_tls: Some(coord.quic_tls_config()),
+        };
+        info!(
+            observed = %reg.observed_ip,
+            relay = %relay.tcp,
+            relay_ws = %relay.ws,
+            relay_quic = %relay.quic,
+            "registered with coord"
+        );
+        relay
+    } else {
+        RelayAddrs {
+            tcp: String::new(),
+            ws: coord.websocket_relay_url(),
+            quic: String::new(),
+            coord_tls: coord.tls_config(),
+            coord_quic_tls: Some(coord.quic_tls_config()),
+        }
     };
-    info!(
-        observed = %reg.observed_ip,
-        relay = %relay.tcp,
-        relay_ws = %relay.ws,
-        "registered with coord"
-    );
 
-    let (signal_tx, signal_rx) = coord.signal().await?;
+    let kick_slot: Arc<Mutex<Option<topaz_fabric::EngineHandle>>> = Arc::new(Mutex::new(None));
+    let kick_slot_cb = kick_slot.clone();
+    let (signal_tx, signal_rx) = coord.spawn_signal_supervisor(Arc::new(move || {
+        if let Some(h) = kick_slot_cb.lock().unwrap().as_ref() {
+            h.kick(false);
+        }
+    }));
 
     let store = Arc::new(Mutex::new(store));
     let status = Arc::new(SharedStatus::new());
@@ -249,6 +505,7 @@ pub async fn cmd_run(
 
     let identity = store.lock().unwrap().identity.clone();
     let services_for_writer = services.clone();
+    let store_for_cache = store.clone();
     let (handle, engine_fut) = topaz_fabric::build(
         EngineDeps {
             identity,
@@ -262,6 +519,12 @@ pub async fn cmd_run(
             signal_rx,
             force_relay,
             enable_mdns,
+            initial_devices,
+            on_devices_cached: Some(Arc::new(move |entries| {
+                if let Ok(s) = store_for_cache.lock() {
+                    let _ = s.save_devices_cache(entries);
+                }
+            })),
         },
         |_handle| {
             let ping = Arc::new(PingService::new(status.clone()));
@@ -276,10 +539,16 @@ pub async fn cmd_run(
         },
         status.clone(),
     );
-
-    let vpn_task = topaz_vpn::spawn(handle.clone(), status.clone(), vpn_status.clone(), vpn_cfg);
+    *kick_slot.lock().unwrap() = Some(handle.clone());
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let vpn_task = topaz_vpn::spawn(
+        handle.clone(),
+        status.clone(),
+        vpn_status.clone(),
+        vpn_cfg,
+        shutdown_tx.subscribe(),
+    );
     let state = Arc::new(crate::control::ControlState {
         store: store.clone(),
         engine: handle,
@@ -291,7 +560,7 @@ pub async fn cmd_run(
         control_lock: tokio::sync::Mutex::new(()),
         pending_adds: std::sync::Mutex::new(std::collections::HashMap::new()),
         started: std::time::Instant::now(),
-        shutdown: shutdown_tx,
+        shutdown: shutdown_tx.clone(),
     });
     tokio::spawn(async move {
         if let Err(e) = crate::control::serve(control_listener, state).await {
@@ -316,18 +585,35 @@ pub async fn cmd_run(
             Ok(())
         }
     };
+    let _ = shutdown_tx.send(true);
     if let Some(t) = vpn_task {
-        t.abort();
+        // Wait briefly so SystemDnsGuard::drop cleanly removes OS split-DNS config.
+        if tokio::time::timeout(Duration::from_secs(2), t).await.is_err() {
+            warn!("VPN task did not finish cleanup within 2s");
+        }
     }
     outcome
 }
 
 async fn shutdown_signal() {
-    use tokio::signal::unix::{signal, SignalKind};
-    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = term.recv() => {}
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 

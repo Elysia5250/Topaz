@@ -24,7 +24,9 @@ pub fn is_advertisable_ip(ip: IpAddr) -> bool {
     }
 }
 
-/// Local QUIC candidates: loopbacks, usable NIC addresses, then coord's observed IP.
+/// Local QUIC candidates: usable NIC addresses, then coord's observed IP.
+/// Loopback (`127.0.0.1` / `::1`) is deliberately excluded so remote peers on
+/// other machines never waste dial attempts on their own loopback interface.
 pub fn collect_local_endpoints(quic_port: u16, observed_ip: Option<&str>) -> Vec<String> {
     let ips = match if_addrs::get_if_addrs() {
         Ok(list) => list.into_iter().map(|iface| iface.ip()).collect(),
@@ -44,9 +46,6 @@ fn assemble_endpoints(quic_port: u16, ips: &[IpAddr], observed_ip: Option<&str>)
             out.push(s);
         }
     };
-
-    push(SocketAddr::from(([127, 0, 0, 1], quic_port)).to_string());
-    push(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, quic_port)).to_string());
 
     let mut extras: Vec<IpAddr> = ips
         .iter()
@@ -88,12 +87,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn collect_always_includes_loopback() {
+    fn collect_excludes_loopback() {
         let eps = collect_local_endpoints(4242, None);
-        assert!(eps.contains(&"127.0.0.1:4242".into()));
-        assert!(eps.contains(&"[::1]:4242".into()));
-        assert_eq!(eps[0], "127.0.0.1:4242");
-        assert_eq!(eps[1], "[::1]:4242");
+        assert!(!eps.contains(&"127.0.0.1:4242".into()));
+        assert!(!eps.contains(&"[::1]:4242".into()));
     }
 
     #[test]
@@ -135,8 +132,8 @@ mod tests {
             "10.0.0.5".parse().unwrap(),
         ];
         let eps = assemble_endpoints(9, &ips, None);
-        assert!(eps.contains(&"127.0.0.1:9".into()));
-        assert!(eps.contains(&"[::1]:9".into()));
+        assert!(!eps.contains(&"127.0.0.1:9".into()));
+        assert!(!eps.contains(&"[::1]:9".into()));
         assert!(eps.contains(&"[2001:da8:ff::10]:9".into()));
         assert!(eps.contains(&"10.0.0.5:9".into()));
         assert!(!eps.iter().any(|e| e.contains("fc00")
@@ -154,9 +151,6 @@ mod tests {
         assert_eq!(eps.iter().filter(|e| *e == "10.0.0.1:1").count(), 1);
 
         let eps = assemble_endpoints(7, &[], Some("127.0.0.1"));
-        assert_eq!(eps.iter().filter(|e| *e == "127.0.0.1:7").count(), 1);
-        assert!(!eps
-            .iter()
-            .any(|e| e.starts_with("127.0.0.1:") && *e != "127.0.0.1:7"));
+        assert!(!eps.iter().any(|e| e.starts_with("127.0.0.1:")));
     }
 }

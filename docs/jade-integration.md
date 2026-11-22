@@ -25,7 +25,7 @@
 | 项目 | 约定值 | 说明 |
 | :--- | :--- | :--- |
 | 控制套接字默认路径 | `$TOPAZ_DATA_DIR/control.sock`，否则 `$HOME/.topaz/control.sock` | 稳定契约；`topaz socket-path` 直接打印该路径，客户端也可用 `--topaz-socket <PATH>` / `TOPAZ_CONTROL_SOCK` 覆盖 |
-| 跨权限访问 | `topaz run` 若以 `sudo` 启动 TUN，会将 `control.sock` 属主/权限保持为原用户可读写（`0660`） | `jade serve` 与 `jade` CLI 始终以普通用户运行，无需 root |
+| 跨权限访问 | `topaz run` 若以 `sudo` 启动 TUN，会将 `control.sock` 属主设为原用户且权限收紧为 `0600`（推荐使用 `sudo topaz service install --system` 以 `SUDO_USER` + `CAP_NET_ADMIN` 最小权限运行） | `jade serve` 与 `jade` CLI 始终以普通用户运行，无需 root，且其它本地用户无法访问 |
 | 注册服务号 | `AGENT_SERVICE_ID = 16` | `topaz` 保留 `1..=15` 给核心能力，`16..=1023` 为注册应用服务段 |
 | 传输层协议 | Unix Domain Socket 上的 **HTTP/1.1 + JSON** 与 **WebSocket（RFC 6455）** | 复用标准 HTTP/WS 协议，无自定义二进制信封 |
 
@@ -230,7 +230,7 @@ jade --on laptop                 topaz (local)              topaz (laptop)      
 ### 6.2 多路并发保障（瞬时突刺有界等待，不静默丢弃）
 
 并发由传输层、桥接池、执行层三层协同完成：
-1. **传输层（`topaz-net::Multiplexer`）**：单条 QUIC/Relay 会话内置多路复用，支持任意数量独立 `Channel`（每条流独立 2 MiB 背压队列 + 小帧优先调度），同一控制端并发对同一目标开多条操作流不会队头阻塞。
+1. **传输层（`topaz-net::Multiplexer`，`mux=v2`）**：直连基于 QUIC 原生双向流、TCP/WSS 中继基于 `yamux` 每流独立流控与半关闭，同一控制端并发对同一目标开多条操作流不会队头阻塞，慢流不会拖垮其它流。
 2. **桥接层（`topaz-cli` Accept 池）**：`jade serve` 维持 **2~4 条**挂起 `GET /v1/services/16/accept` WebSocket 连接；每当一条远端 `/v1/services/16/open/{target}` 到达，`topaz` 的 `ServiceRegistry` 立即弹出一根空闲 WS 发送 `"accepted"` 交接帧，`jade serve` 当即 `tokio::spawn` 处理并异步补回空闲池。瞬时超过池深度的流在 20 秒注册宽限内最多等待 2 秒，不会静默丢弃。
 3. **执行层（`jade`）**：长耗时操作转后台 `Job` 落盘异步执行；单控 Agent 可同一时刻向 N 台机器并行下发 `exec`/`read`/`edit` 并同时订阅多路 `Job` 日志流。
 

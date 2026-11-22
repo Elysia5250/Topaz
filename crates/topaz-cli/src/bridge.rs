@@ -751,9 +751,16 @@ async fn splice_ws_channel(socket: WebSocket, channel: Channel) {
         let _ = ch_w.shutdown().await;
     };
 
+    // Half-close friendly splice: if the local WS side closes its write half
+    // first, shut down only the outbound channel write half and give `to_ws`
+    // up to 5 seconds to drain any remaining remote response frames.
+    tokio::pin!(to_ws);
+    tokio::pin!(to_ch);
     tokio::select! {
-        _ = to_ws => {}
-        _ = to_ch => {}
+        _ = &mut to_ws => {}
+        _ = &mut to_ch => {
+            let _ = tokio::time::timeout(Duration::from_secs(5), &mut to_ws).await;
+        }
     }
 }
 

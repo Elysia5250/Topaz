@@ -61,11 +61,9 @@ impl Store {
             .root
             .join("tmp")
             .join(format!("{name}.{}.{seq}.tmp", std::process::id()));
-        std::fs::write(&tmp, data)?;
-        chown_to_sudo_user(&tmp);
+        write_new_file(&tmp, data.as_bytes(), 0o600)?;
         let dst = self.root.join(name);
         std::fs::rename(&tmp, &dst).with_context(|| format!("write {name}"))?;
-        chown_to_sudo_user(&dst);
         Ok(())
     }
 
@@ -120,6 +118,18 @@ impl Store {
     pub fn write_status(&self, value: &serde_json::Value) -> Result<()> {
         self.atomic_write("status.json", serde_json::to_string_pretty(value)?)
     }
+
+    pub fn load_devices_cache(&self) -> Vec<topaz_proto::DeviceEntry> {
+        let path = self.root.join("devices_cache.json");
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return Vec::new();
+        };
+        serde_json::from_str(&raw).unwrap_or_default()
+    }
+
+    pub fn save_devices_cache(&self, entries: &[topaz_proto::DeviceEntry]) -> Result<()> {
+        self.atomic_write("devices_cache.json", serde_json::to_string_pretty(entries)?)
+    }
 }
 
 fn dirs_next_home() -> Option<PathBuf> {
@@ -151,15 +161,61 @@ fn sudo_user_home() -> Option<PathBuf> {
     }
 }
 
+/// Create a brand-new file without following symlinks, apply `mode` and
+/// transfer ownership to `SUDO_UID`/`SUDO_GID` via `fchown` on the open fd.
+pub fn write_new_file(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .with_context(|| format!("create {}", path.display()))?;
+        f.write_all(contents)
+            .with_context(|| format!("write {}", path.display()))?;
+        unsafe {
+            libc::fchmod(f.as_raw_fd(), mode as libc::mode_t);
+        }
+        chown_fd_to_sudo_user(f.as_raw_fd());
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+        std::fs::write(path, contents).with_context(|| format!("write {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// If running under `sudo`, transfer ownership of an open fd back to the
+/// invoking user (`SUDO_UID`/`SUDO_GID`) without following symlinks.
+#[cfg(unix)]
+pub fn chown_fd_to_sudo_user(fd: std::os::unix::io::RawFd) {
+    if let (Ok(uid_s), Ok(gid_s)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID")) {
+        if let (Ok(uid), Ok(gid)) = (uid_s.parse::<libc::uid_t>(), gid_s.parse::<libc::gid_t>()) {
+            unsafe {
+                libc::fchown(fd, uid, gid);
+            }
+        }
+    }
+}
+
 /// If running under `sudo`, transfer ownership of `path` back to the invoking
-/// user (`SUDO_UID`/`SUDO_GID`) so non-root CLI/TUI commands stay usable.
+/// user (`SUDO_UID`/`SUDO_GID`) using `lchown` (never follows symlinks).
 #[cfg(unix)]
 pub fn chown_to_sudo_user(path: &Path) {
     if let (Ok(uid_s), Ok(gid_s)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID")) {
         if let (Ok(uid), Ok(gid)) = (uid_s.parse::<libc::uid_t>(), gid_s.parse::<libc::gid_t>()) {
             if let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
                 unsafe {
-                    libc::chown(c_path.as_ptr(), uid, gid);
+                    libc::lchown(c_path.as_ptr(), uid, gid);
                 }
             }
         }

@@ -1,16 +1,25 @@
 use crate::db::Db;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use topaz_proto::auth::{evaluate, DeviceSet, MAX_SKEW_SECS};
 use topaz_proto::{DeviceEntry, EnrollReply, SignalEnvelope};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Semaphore};
 
 /// Devices that stop re-registering are treated as offline after this.
 pub const ONLINE_TTL_SECS: u64 = 60;
 /// Enrollment mailboxes live 5 minutes: enough to carry a `setup` bundle to
 /// the other machine by hand, still a narrow one-time window.
 pub const MAILBOX_TTL: Duration = Duration::from_secs(300);
+
+/// Max nonces tracked per device inside the `2 * MAX_SKEW_SECS` replay window.
+const MAX_NONCES_PER_DEVICE: usize = 1024;
+/// Max distinct devices tracked in the in-memory replay cache.
+const MAX_NONCE_DEVICES: usize = 8192;
+/// Max concurrent long-lived WebSocket connections (signal + relay WS), kept
+/// well below `tls::MAX_CONCURRENT_CONNS` so control-plane HTTP never starves.
+pub const MAX_WS_CONNS: usize = 2048;
 
 pub struct Online {
     pub user_id: String,
@@ -24,7 +33,62 @@ pub struct Mailbox {
     pub created: Instant,
     pub msg_a: String,
     pub reply: Option<EnrollReply>,
+    pub finish_token: Option<String>,
     pub finish: Option<String>,
+}
+
+/// Simple per-IP token bucket for unauthenticated public endpoints.
+struct IpBucket {
+    tokens: f64,
+    last: Instant,
+}
+
+pub struct RateLimiter {
+    rate_per_sec: f64,
+    burst: f64,
+    buckets: Mutex<HashMap<IpAddr, IpBucket>>,
+}
+
+impl RateLimiter {
+    pub fn new(per_minute: u32, burst: u32) -> Self {
+        Self {
+            rate_per_sec: (per_minute.max(1) as f64) / 60.0,
+            burst: burst.max(1) as f64,
+            buckets: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn allow(&self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        let mut map = self.buckets.lock().unwrap();
+        if map.len() > 16_384 {
+            map.retain(|_, b| now.saturating_duration_since(b.last) < Duration::from_secs(300));
+            if map.len() > 16_384 {
+                return false;
+            }
+        }
+        let bucket = map.entry(ip).or_insert_with(|| IpBucket {
+            tokens: self.burst,
+            last: now,
+        });
+        let elapsed = now.saturating_duration_since(bucket.last).as_secs_f64();
+        bucket.last = now;
+        bucket.tokens = (bucket.tokens + elapsed * self.rate_per_sec).min(self.burst);
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn purge(&self) {
+        let now = Instant::now();
+        self.buckets
+            .lock()
+            .unwrap()
+            .retain(|_, b| now.saturating_duration_since(b.last) < Duration::from_secs(300));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -43,10 +107,18 @@ pub struct AppState {
     relay_ws_port: Mutex<Option<u16>>,
     /// `(advertised host:port override, bound port)`; None while STUN is off.
     stun: Mutex<Option<(Option<String>, u16)>>,
+    /// `(advertised host:port override, bound port)`; None while QUIC datagram relay is off.
+    relay_quic: Mutex<Option<(Option<String>, u16)>>,
     pub online: Mutex<HashMap<String, Online>>,
-    nonces: Mutex<HashMap<String, u64>>,
+    /// Per-device replay cache: `device_id -> (nonce -> timestamp)`.
+    nonces: Mutex<HashMap<String, HashMap<String, u64>>>,
     pub mailboxes: Mutex<HashMap<String, Mailbox>>,
     signals: Mutex<HashMap<String, broadcast::Sender<SignalEnvelope>>>,
+    /// Fast in-memory `device_id -> user_id` cache for `/v1/signal` routing.
+    device_users: Mutex<HashMap<String, String>>,
+    pub enroll_limiter: RateLimiter,
+    pub account_limiter: RateLimiter,
+    pub ws_semaphore: Arc<Semaphore>,
 }
 
 pub fn now_unix() -> u64 {
@@ -87,10 +159,15 @@ impl AppState {
             https_port,
             relay_ws_port: Mutex::new(None),
             stun: Mutex::new(None),
+            relay_quic: Mutex::new(None),
             online: Mutex::new(HashMap::new()),
             nonces: Mutex::new(HashMap::new()),
             mailboxes: Mutex::new(HashMap::new()),
             signals: Mutex::new(HashMap::new()),
+            device_users: Mutex::new(HashMap::new()),
+            enroll_limiter: RateLimiter::new(120, 40),
+            account_limiter: RateLimiter::new(20, 10),
+            ws_semaphore: Arc::new(Semaphore::new(MAX_WS_CONNS)),
         }
     }
 
@@ -108,6 +185,23 @@ impl AppState {
     /// STUN endpoint for the register response; empty while STUN is off.
     pub fn advertise_stun(&self, host_header: Option<&str>) -> String {
         let Some((advertise, port)) = &*self.stun.lock().unwrap() else {
+            return String::new();
+        };
+        if let Some(adv) = advertise {
+            return adv.clone();
+        }
+        let host = host_without_port(host_header);
+        format!("{host}:{port}")
+    }
+
+    /// Record the UDP/QUIC datagram relay listener (`advertise` as `host:port`, or derived).
+    pub fn set_relay_quic(&self, advertise: Option<String>, port: u16) {
+        *self.relay_quic.lock().unwrap() = Some((advertise, port));
+    }
+
+    /// UDP/QUIC datagram relay endpoint for the register response; empty when off.
+    pub fn advertise_relay_quic(&self, host_header: Option<&str>) -> String {
+        let Some((advertise, port)) = &*self.relay_quic.lock().unwrap() else {
             return String::new();
         };
         if let Some(adv) = advertise {
@@ -136,18 +230,30 @@ impl AppState {
         })
     }
 
-    /// Accept a signed message's time and nonce at most once.
-    pub fn fresh(&self, time: u64, nonce: &str) -> bool {
+    /// Accept a signed message's time and nonce at most once per device.
+    /// Per-device isolation ensures one noisy or compromised device cannot
+    /// exhaust the replay cache for other accounts or devices.
+    pub fn fresh(&self, device_id: &str, time: u64, nonce: &str) -> bool {
         let now = now_unix();
         if time.abs_diff(now) > MAX_SKEW_SECS || nonce.len() < 16 || nonce.len() > 128 {
             return false;
         }
-        let mut nonces = self.nonces.lock().unwrap();
-        nonces.retain(|_, t| now.saturating_sub(*t) <= 2 * MAX_SKEW_SECS);
-        if nonces.len() >= 65_536 {
+        let mut by_dev = self.nonces.lock().unwrap();
+        if !by_dev.contains_key(device_id) && by_dev.len() >= MAX_NONCE_DEVICES {
+            by_dev.retain(|_, map| {
+                map.retain(|_, t| now.saturating_sub(*t) <= 2 * MAX_SKEW_SECS);
+                !map.is_empty()
+            });
+            if by_dev.len() >= MAX_NONCE_DEVICES {
+                return false;
+            }
+        }
+        let dev_nonces = by_dev.entry(device_id.to_string()).or_default();
+        dev_nonces.retain(|_, t| now.saturating_sub(*t) <= 2 * MAX_SKEW_SECS);
+        if dev_nonces.len() >= MAX_NONCES_PER_DEVICE {
             return false;
         }
-        nonces.insert(nonce.to_string(), time).is_none()
+        dev_nonces.insert(nonce.to_string(), time).is_none()
     }
 
     pub fn advertise_relay(&self, host_header: Option<&str>) -> String {
@@ -186,6 +292,20 @@ impl AppState {
     pub fn drop_device(&self, device_id: &str) {
         self.online.lock().unwrap().remove(device_id);
         self.signals.lock().unwrap().remove(device_id);
+        self.device_users.lock().unwrap().remove(device_id);
+        self.nonces.lock().unwrap().remove(device_id);
+    }
+
+    pub fn cache_device_user(&self, device_id: &str, user_id: &str) {
+        let mut cache = self.device_users.lock().unwrap();
+        if cache.len() > 65_536 {
+            cache.clear();
+        }
+        cache.insert(device_id.to_string(), user_id.to_string());
+    }
+
+    pub fn cached_device_user(&self, device_id: &str) -> Option<String> {
+        self.device_users.lock().unwrap().get(device_id).cloned()
     }
 
     pub fn subscribe_signals(&self, device_id: &str) -> broadcast::Receiver<SignalEnvelope> {
@@ -193,6 +313,13 @@ impl AppState {
         map.entry(device_id.to_string())
             .or_insert_with(|| broadcast::channel(64).0)
             .subscribe()
+    }
+
+    pub fn unsubscribe_signal_if_idle(&self, device_id: &str) {
+        let mut map = self.signals.lock().unwrap();
+        if map.get(device_id).is_some_and(|tx| tx.receiver_count() == 0) {
+            map.remove(device_id);
+        }
     }
 
     pub fn route_signal(&self, env: SignalEnvelope) {
@@ -206,6 +333,27 @@ impl AppState {
             .lock()
             .unwrap()
             .retain(|_, m| m.created.elapsed() < MAILBOX_TTL);
+    }
+
+    /// Periodic janitor: prune stale online entries, idle signal channels,
+    /// expired enrollment mailboxes, expired nonces, and rate-limiter buckets.
+    pub fn purge_stale(&self) {
+        let now = now_unix();
+        self.online
+            .lock()
+            .unwrap()
+            .retain(|_, o| now.saturating_sub(o.last_seen) <= ONLINE_TTL_SECS * 2);
+        self.signals
+            .lock()
+            .unwrap()
+            .retain(|_, tx| tx.receiver_count() > 0);
+        self.purge_mailboxes();
+        self.nonces.lock().unwrap().retain(|_, map| {
+            map.retain(|_, t| now.saturating_sub(*t) <= 2 * MAX_SKEW_SECS);
+            !map.is_empty()
+        });
+        self.enroll_limiter.purge();
+        self.account_limiter.purge();
     }
 }
 

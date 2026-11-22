@@ -27,12 +27,22 @@ const JOIN_RETRY_PAUSE: Duration = Duration::from_secs(1);
 const TCP_DIAL: Duration = Duration::from_secs(3);
 const WS_FRAME: usize = 16 * 1024;
 
-/// How to reach the coord relay: TCP first, WebSocket if that path is blocked.
+/// How to reach the coord relay: TCP first, WebSocket if that path is blocked,
+/// plus optional UDP/QUIC unreliable datagram relay for L3 VPN packets.
 #[derive(Clone)]
 pub struct RelayAddrs {
     pub tcp: String,
     pub ws: String,
+    pub quic: String,
     pub coord_tls: Arc<rustls::ClientConfig>,
+    pub coord_quic_tls: Option<Arc<rustls::ClientConfig>>,
+}
+
+/// Authenticated inner-mTLS relay stream paired with forward-secret E2E
+/// datagram keys exported via RFC 5705 TLS 1.3 key exporter.
+pub struct RelayStream {
+    pub tls: TlsStream<RelayTunnel>,
+    pub dgram_keys: [u8; 64],
 }
 
 /// Byte pipe used as the outer hop (TCP or WSS). Inner mTLS still runs on top.
@@ -97,7 +107,7 @@ pub async fn connect_relay(
     identity: &DeviceIdentity,
     trust: &TrustStore,
     peer_id: &str,
-) -> Result<TlsStream<RelayTunnel>> {
+) -> Result<RelayStream> {
     connect_relay_attempts(addrs, identity, trust, peer_id, JOIN_ATTEMPTS).await
 }
 
@@ -108,7 +118,7 @@ pub async fn connect_relay_once(
     identity: &DeviceIdentity,
     trust: &TrustStore,
     peer_id: &str,
-) -> Result<TlsStream<RelayTunnel>> {
+) -> Result<RelayStream> {
     connect_relay_attempts(addrs, identity, trust, peer_id, 1).await
 }
 
@@ -118,7 +128,7 @@ async fn connect_relay_attempts(
     trust: &TrustStore,
     peer_id: &str,
     attempts: usize,
-) -> Result<TlsStream<RelayTunnel>> {
+) -> Result<RelayStream> {
     let mut last_err: Option<JoinError> = None;
     let mut prefer_ws = false;
     for attempt in 1..=attempts {
@@ -373,8 +383,8 @@ async fn upgrade_relay_tls(
     identity: &DeviceIdentity,
     trust: &TrustStore,
     peer_id: &str,
-) -> Result<TlsStream<RelayTunnel>> {
-    let tls: TlsStream<RelayTunnel> = if identity.device_id.as_str() < peer_id {
+) -> Result<RelayStream> {
+    let mut tls: TlsStream<RelayTunnel> = if identity.device_id.as_str() < peer_id {
         let connector = TlsConnector::from(Arc::new(client_config(identity, trust)?));
         let s = connector
             .connect(ServerName::try_from("topaz")?, stream)
@@ -395,7 +405,125 @@ async fn upgrade_relay_tls(
     if authenticated != peer_id {
         bail!("relay peer authenticated as {authenticated}, expected {peer_id}");
     }
-    Ok(tls)
+
+    // Export 64 bytes of forward-secret E2E keying material (32B per direction)
+    // for the coord UDP/QUIC unreliable datagram relay so coord only ever sees
+    // opaque ChaCha20-Poly1305 ciphertext.
+    let mut dgram_keys = [0u8; 64];
+    match &tls {
+        TlsStream::Client(s) => s.get_ref().1.export_keying_material(
+            &mut dgram_keys,
+            b"topaz-relay-dgram-v1",
+            None,
+        ),
+        TlsStream::Server(s) => s.get_ref().1.export_keying_material(
+            &mut dgram_keys,
+            b"topaz-relay-dgram-v1",
+            None,
+        ),
+    }
+    .map_err(|e| anyhow!("export relay datagram keys: {e}"))?;
+
+    // Exchange 1-byte protocol version so v1/v2 mismatches fail fast cleanly.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tls.write_all(&[topaz_proto::mux::MUX_VERSION]).await?;
+        tls.flush().await?;
+        let mut peer_ver = [0u8; 1];
+        tls.read_exact(&mut peer_ver).await?;
+        if peer_ver[0] != topaz_proto::mux::MUX_VERSION {
+            bail!(
+                "unsupported relay mux version {} (expected {})",
+                peer_ver[0],
+                topaz_proto::mux::MUX_VERSION
+            );
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .map_err(|_| anyhow!("timed out negotiating relay mux version"))??;
+
+    Ok(RelayStream { tls, dgram_keys })
+}
+
+/// Connect to coord's UDP/QUIC unreliable datagram relay (port 7724 by default),
+/// authenticate via signed `RelayHello`, and wait for `READY`.
+pub async fn connect_quic_datagram_relay(
+    addr_str: &str,
+    quic_tls: &Arc<rustls::ClientConfig>,
+    identity: &DeviceIdentity,
+    peer_id: &str,
+) -> Result<quinn::Connection> {
+    let target_str = addr_str.trim().to_string();
+    if target_str.is_empty() {
+        bail!("no quic datagram relay address");
+    }
+    let remote = tokio::task::spawn_blocking(move || -> Result<std::net::SocketAddr> {
+        use std::net::ToSocketAddrs;
+        let mut addrs = target_str
+            .to_socket_addrs()
+            .with_context(|| format!("resolve quic relay {target_str}"))?;
+        addrs
+            .next()
+            .ok_or_else(|| anyhow!("quic relay {target_str} resolved to no addresses"))
+    })
+    .await??;
+
+    let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from((**quic_tls).clone())?;
+    let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_crypto));
+    let mut transport = quinn::TransportConfig::default();
+    transport.initial_mtu(1350);
+    transport.max_idle_timeout(Some(Duration::from_secs(30).try_into()?));
+    transport.keep_alive_interval(Some(Duration::from_secs(10)));
+    transport.datagram_receive_buffer_size(Some(256 * 1024));
+    transport.datagram_send_buffer_size(1024 * 1024);
+    client_cfg.transport_config(Arc::new(transport));
+
+    let bind_addr: std::net::SocketAddr = if remote.is_ipv6() {
+        "[::]:0".parse()?
+    } else {
+        "0.0.0.0:0".parse()?
+    };
+    let mut endpoint = quinn::Endpoint::client(bind_addr)?;
+    endpoint.set_default_client_config(client_cfg);
+
+    let conn = tokio::time::timeout(
+        Duration::from_secs(5),
+        endpoint.connect(remote, "topaz-coord")?,
+    )
+    .await
+    .map_err(|_| anyhow!("quic datagram relay connect timed out"))??;
+
+    let (mut send, mut recv) = conn.open_bi().await?;
+    let mut nonce = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let nonce = hex::encode(nonce);
+    let time = now_unix();
+    let hello = RelayHello {
+        device_id: identity.device_id.clone(),
+        peer_id: peer_id.to_string(),
+        time,
+        sig: identity.sign_hex(&relay_signing_bytes(
+            &identity.device_id,
+            peer_id,
+            time,
+            &nonce,
+        )),
+        nonce,
+    };
+    let bytes = postcard::to_stdvec(&hello)?;
+    send.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
+    send.write_all(&bytes).await?;
+    let _ = send.finish();
+
+    let mut ready = [0u8; 1];
+    tokio::time::timeout(PEER_WAIT, recv.read_exact(&mut ready))
+        .await
+        .map_err(|_| anyhow!("peer did not join quic datagram relay"))??;
+    match ready[0] {
+        1 => Ok(conn),
+        2 => bail!("relay session limit reached for this account"),
+        _ => bail!("quic datagram relay rejected the session"),
+    }
 }
 
 #[cfg(test)]

@@ -435,9 +435,50 @@ impl Db {
     pub fn set_revocation(&self, rev: &Revocation) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE devices SET revocation = ?1, dns_name = NULL WHERE device_id = ?2 AND revocation IS NULL",
+            "UPDATE devices SET revocation = ?1, dns_name = NULL WHERE device_id = ?2",
             params![serde_json::to_string(rev)?, rev.device_id],
         )?;
+        Ok(())
+    }
+
+    /// Re-assign `dns_name` for any device that is currently active according to
+    /// `active_ids` (e.g. if a previously stored revocation became invalid after
+    /// its issuer was revoked by the root key) but currently has `dns_name IS NULL`.
+    pub fn ensure_active_dns_names(
+        &self,
+        user_id: &str,
+        active_ids: &HashSet<String>,
+    ) -> Result<()> {
+        if active_ids.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let missing: Vec<(String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT device_id, cert FROM devices \
+                 WHERE user_id = ?1 AND (dns_name IS NULL OR revocation IS NOT NULL) \
+                 ORDER BY rowid",
+            )?;
+            let rows = stmt
+                .query_map(params![user_id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        for (device_id, cert_json) in missing {
+            if !active_ids.contains(&device_id) {
+                continue;
+            }
+            let cert: DeviceCert = serde_json::from_str(&cert_json)?;
+            let dns = allocate_dns_name(&tx, user_id, &device_id, &cert.name)?;
+            tx.execute(
+                "UPDATE devices SET revocation = NULL, dns_name = ?1 WHERE device_id = ?2",
+                params![dns, device_id],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 }

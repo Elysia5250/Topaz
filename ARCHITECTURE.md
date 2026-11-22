@@ -70,9 +70,9 @@
    - `Service::on_stream(peer, channel)` 在 `topaz` 引擎主循环上内联运行。
    - **轮次型服务（`opal`）**：在一轮 `handle_stream` 内跑完返回，天然保证同步轮次串行化。
    - **长驻/并发型服务（`jade`）**：一条命令可能运行数分钟，必须在 `on_stream` 中 `tokio::spawn` 独立任务接管 `channel` 并立即返回，否则会阻塞引擎主循环的心跳与其它服务。
-3. **背压与取消语义**：
-   - **持续排水或尽早 drop**：`Multiplexer` 单流写缓冲上限 2 MiB，且控制帧/≤4 KiB 小帧优先；若上层服务停止读取对端入站流导致拥塞，`topaz` 会 teardown 整条会话并重连。
-   - **EOF 即取消**：`drop(channel)` 发送 `Frame::Close` 半闭流，接收端读到 EOF 即视为取消信号（`jade` 据此强杀子进程组、回滚未提交的 `.part` 写入）。
+3. **背压与取消语义（`mux=v2`）**：
+   - **独立流控、无队头阻塞**：直连使用 QUIC 原生双向流，TCP/WSS 中继使用 `yamux` 每流独立窗口流控（单条慢流不会拖垮整条会话或阻塞其它服务流）；中继 L3 数据报优先经由端到端 ChaCha20-Poly1305 加密的 UDP/QUIC Datagram Relay（`7724/udp`）透传，避免 TCP-over-TCP 拥塞崩溃。
+   - **真半关闭与 EOF 取消**：`shutdown()` 仅关闭写方向（保留读方向接收尾包），`drop(channel)` 发送 FIN/RESET，接收端读到 EOF 即视为取消信号（`jade` 据此强杀子进程组、回滚未提交的 `.part` 写入）。
 
 ---
 

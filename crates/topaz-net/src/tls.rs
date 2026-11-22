@@ -207,6 +207,17 @@ pub fn pinned_client_config(pin: [u8; 20]) -> Result<rustls::ClientConfig> {
     Ok(config)
 }
 
+/// Client TLS config for the coord UDP/QUIC unreliable datagram relay.
+pub fn pinned_quic_client_config(pin: [u8; 20]) -> Result<rustls::ClientConfig> {
+    let mut config = rustls::ClientConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedVerifier { pin }))
+        .with_no_client_auth();
+    config.alpn_protocols = vec![topaz_proto::mux::ALPN_DGRAM_RELAY.to_vec()];
+    Ok(config)
+}
+
 /// Perform a one-shot TLS 1.3 handshake with `coord_url` to learn its Ed25519
 /// certificate pin for SSH-style trust-on-first-use (TOFU) confirmation.
 pub async fn probe_coord_pin(coord_url: &str) -> Result<String> {

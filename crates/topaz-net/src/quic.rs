@@ -1,20 +1,143 @@
 use crate::tls::{client_config, peer_device_id, server_config, TrustStore};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use quinn::{ClientConfig, Connection, Endpoint, RecvStream, SendStream, ServerConfig};
+use quinn::udp::{RecvMeta, Transmit};
+use quinn::{AsyncUdpSocket, ClientConfig, Connection, Endpoint, RecvStream, SendStream, ServerConfig, UdpPoller};
+use rand::RngCore;
 use rustls::pki_types::CertificateDer;
+use std::collections::HashMap;
+use std::io::{self, IoSliceMut};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
-use topaz_core::DeviceIdentity;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context as TaskContext, Poll};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tracing::{info, warn};
+use tokio::sync::oneshot;
+use topaz_core::DeviceIdentity;
+use topaz_proto::stun::{binding_request, parse_binding_response, BINDING_RESPONSE, MAGIC};
+use tracing::{debug, info, warn};
+
+/// Custom `quinn::AsyncUdpSocket` wrapper that demultiplexes RFC 5389 STUN
+/// Binding Responses on the same UDP port used by QUIC.
+///
+/// Zero-overhead hot path: an atomic waiter counter avoids even locking the
+/// waiter table whenever no STUN probe is in flight.
+#[derive(Debug)]
+struct DemuxUdpSocket {
+    inner: Arc<dyn AsyncUdpSocket>,
+    waiter_count: AtomicUsize,
+    stun_waiters: Mutex<HashMap<[u8; 12], oneshot::Sender<SocketAddr>>>,
+}
+
+impl DemuxUdpSocket {
+    fn new(inner: Arc<dyn AsyncUdpSocket>) -> Self {
+        Self {
+            inner,
+            waiter_count: AtomicUsize::new(0),
+            stun_waiters: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn register_stun(&self, txn: [u8; 12]) -> oneshot::Receiver<SocketAddr> {
+        let (tx, rx) = oneshot::channel();
+        self.stun_waiters.lock().unwrap().insert(txn, tx);
+        self.waiter_count.fetch_add(1, Ordering::Release);
+        rx
+    }
+
+    fn unregister_stun(&self, txn: &[u8; 12]) {
+        if self.stun_waiters.lock().unwrap().remove(txn).is_some() {
+            self.waiter_count.fetch_sub(1, Ordering::Release);
+        }
+    }
+}
+
+fn is_stun_binding_response(pkt: &[u8]) -> bool {
+    pkt.len() >= 20
+        && (pkt[0] & 0xc0) == 0
+        && u16::from_be_bytes([pkt[0], pkt[1]]) == BINDING_RESPONSE
+        && u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]) == MAGIC
+}
+
+impl AsyncUdpSocket for DemuxUdpSocket {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+        self.inner.clone().create_io_poller()
+    }
+
+    fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
+        self.inner.try_send(transmit)
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut TaskContext<'_>,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        loop {
+            let n = match self.inner.poll_recv(cx, bufs, meta) {
+                Poll::Ready(Ok(n)) => n,
+                other => return other,
+            };
+            if self.waiter_count.load(Ordering::Acquire) == 0 {
+                return Poll::Ready(Ok(n));
+            }
+            let mut write_idx = 0usize;
+            for i in 0..n {
+                let len = meta[i].len;
+                let pkt = &bufs[i][..len];
+                if is_stun_binding_response(pkt) {
+                    let mut txn = [0u8; 12];
+                    txn.copy_from_slice(&pkt[8..20]);
+                    if let Some(mapped) = parse_binding_response(pkt, &txn) {
+                        if let Some(tx) = self.stun_waiters.lock().unwrap().remove(&txn) {
+                            self.waiter_count.fetch_sub(1, Ordering::Release);
+                            let _ = tx.send(mapped);
+                            continue;
+                        }
+                    }
+                }
+                if write_idx != i {
+                    let tmp = bufs[i][..len].to_vec();
+                    bufs[write_idx][..len].copy_from_slice(&tmp);
+                    meta[write_idx] = meta[i];
+                }
+                write_idx += 1;
+            }
+            if write_idx > 0 {
+                return Poll::Ready(Ok(write_idx));
+            }
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        self.inner.max_transmit_segments()
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        self.inner.max_receive_segments()
+    }
+
+    fn may_fragment(&self) -> bool {
+        self.inner.may_fragment()
+    }
+}
 
 #[derive(Clone)]
 pub struct QuicEndpoint {
     pub endpoint: Endpoint,
     pub local_addr: SocketAddr,
+    demux: Arc<DemuxUdpSocket>,
 }
 
+/// One native bidirectional QUIC stream implementing `AsyncRead + AsyncWrite`
+/// with true half-close semantics (`poll_shutdown` closes only `send`).
 pub struct QuicStream {
     pub send: SendStream,
     pub recv: RecvStream,
@@ -60,43 +183,10 @@ impl AsyncWrite for QuicStream {
     }
 }
 
+/// Authenticated direct QUIC connection carrying native multiplexed streams
+/// and unreliable RFC 9221 datagrams.
 pub struct QuicLink {
     pub conn: Connection,
-    pub stream: QuicStream,
-}
-
-impl AsyncRead for QuicLink {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.stream).poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for QuicLink {
-    fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        std::pin::Pin::new(&mut self.stream).poll_write(cx, buf)
-    }
-
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        std::pin::Pin::new(&mut self.stream).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
-    }
 }
 
 fn authenticated_peer(conn: &Connection) -> Result<String> {
@@ -112,22 +202,24 @@ fn authenticated_peer(conn: &Connection) -> Result<String> {
 fn transport_config() -> Result<quinn::TransportConfig> {
     let mut transport = quinn::TransportConfig::default();
     transport.initial_mtu(1350);
-    transport.max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into()?));
-    transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+    transport.max_idle_timeout(Some(Duration::from_secs(30).try_into()?));
+    transport.keep_alive_interval(Some(Duration::from_secs(10)));
     transport.datagram_receive_buffer_size(Some(256 * 1024));
     transport.datagram_send_buffer_size(1024 * 1024);
     Ok(transport)
 }
 
 fn server_cfg(identity: &DeviceIdentity, trust: &TrustStore) -> Result<ServerConfig> {
-    let server_crypto = QuicServerConfig::try_from(server_config(identity, trust)?)?;
+    let mut tls = server_config(identity, trust)?;
+    tls.alpn_protocols = vec![topaz_proto::mux::ALPN_DIRECT.to_vec()];
+    let server_crypto = QuicServerConfig::try_from(tls)?;
     let mut server = ServerConfig::with_crypto(Arc::new(server_crypto));
     server.transport = Arc::new(transport_config()?);
     Ok(server)
 }
 
 /// Bind UDP `[::]:0` with `IPV6_V6ONLY=false` so IPv4-mapped and IPv6 share one socket.
-fn dual_stack_udp() -> std::io::Result<std::net::UdpSocket> {
+fn dual_stack_udp() -> io::Result<std::net::UdpSocket> {
     let socket = socket2::Socket::new(
         socket2::Domain::IPV6,
         socket2::Type::DGRAM,
@@ -142,20 +234,26 @@ fn dual_stack_udp() -> std::io::Result<std::net::UdpSocket> {
     Ok(socket.into())
 }
 
-fn bind_dual_stack(server: ServerConfig, sock: std::net::UdpSocket) -> Result<Endpoint> {
+fn bind_with_demux(
+    server: ServerConfig,
+    sock: std::net::UdpSocket,
+) -> Result<(Endpoint, Arc<DemuxUdpSocket>)> {
     let runtime = quinn::default_runtime().ok_or_else(|| anyhow!("no async runtime"))?;
-    Endpoint::new(
+    let wrapped = runtime.wrap_udp_socket(sock)?;
+    let demux = Arc::new(DemuxUdpSocket::new(wrapped));
+    let ep = Endpoint::new_with_abstract_socket(
         quinn::EndpointConfig::default(),
         Some(server),
-        sock,
+        demux.clone(),
         runtime,
     )
-    .context("dual-stack QUIC endpoint")
+    .context("demux QUIC endpoint")?;
+    Ok((ep, demux))
 }
 
 /// Quinn rejects a remote whose family does not match the bound socket.
 /// Dual-stack `[::]` needs IPv4 remotes rewritten as v4-mapped IPv6.
-fn remote_for_endpoint(local: SocketAddr, remote: SocketAddr) -> SocketAddr {
+pub(crate) fn remote_for_endpoint(local: SocketAddr, remote: SocketAddr) -> SocketAddr {
     match (local, remote) {
         (SocketAddr::V6(_), SocketAddr::V4(v4)) => {
             SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port())
@@ -170,17 +268,19 @@ fn remote_for_endpoint(local: SocketAddr, remote: SocketAddr) -> SocketAddr {
 }
 
 impl QuicEndpoint {
-    /// Bind the QUIC socket and, when `stun` is given, learn its UDP mapping
-    /// from that server **before** quinn takes the socket over: restricted
-    /// and full-cone NATs map by local endpoint, so the learned address is
-    /// the one later handshakes share. Returns the mapped address, None when
-    /// no STUN was requested or the probe failed (direct/relay keep working).
+    /// Bind the QUIC socket with live STUN/QUIC demultiplexing.
+    ///
+    /// Pass `stun: None` to bind instantaneously without blocking; use the
+    /// async [`Self::probe_stun`] method at startup and periodically on the
+    /// live socket to learn/refresh the NAT mapping.
     pub fn bind(
         identity: &DeviceIdentity,
         trust: &TrustStore,
         stun: Option<SocketAddr>,
     ) -> Result<(Self, Option<SocketAddr>)> {
-        let client_crypto = QuicClientConfig::try_from(client_config(identity, trust)?)?;
+        let mut tls_client = client_config(identity, trust)?;
+        tls_client.alpn_protocols = vec![topaz_proto::mux::ALPN_DIRECT.to_vec()];
+        let client_crypto = QuicClientConfig::try_from(tls_client)?;
         let mut client_cfg = ClientConfig::new(Arc::new(client_crypto));
         client_cfg.transport_config(Arc::new(transport_config()?));
 
@@ -188,24 +288,17 @@ impl QuicEndpoint {
             Ok(s) => s,
             Err(e) => {
                 warn!(error = %e, "dual-stack UDP bind failed; falling back to 0.0.0.0:0");
-                std::net::UdpSocket::bind("0.0.0.0:0")?
+                let s = std::net::UdpSocket::bind("0.0.0.0:0")?;
+                s.set_nonblocking(true)?;
+                s
             }
         };
-        // Probe while the socket is still ours: the receive queue has no
-        // quinn task racing for packets yet. The probe clone shares the same
-        // kernel socket, hence the same NAT mapping.
+
         let mapped = stun.and_then(|server| match sock.try_clone() {
             Ok(clone) => {
-                // dual_stack_udp leaves the socket nonblocking for quinn; a
-                // nonblocking clone would report WouldBlock before any reply
-                // could arrive, so flip to blocking for the probe and always
-                // restore nonblocking afterwards (Unix clones share O_NONBLOCK).
                 let _ = clone.set_nonblocking(false);
-                let res = crate::stun::probe_with_timeout(
-                    &clone,
-                    server,
-                    std::time::Duration::from_secs(2),
-                );
+                let res =
+                    crate::stun::probe_with_timeout(&clone, server, Duration::from_secs(2));
                 let _ = clone.set_nonblocking(true);
                 match res {
                     Ok(mapped) => {
@@ -218,17 +311,18 @@ impl QuicEndpoint {
                     }
                 }
             }
-            Err(e) => {
-                warn!(error = %e, "socket clone failed; stun probe skipped");
-                None
-            }
+            Err(_) => None,
         });
 
-        let mut endpoint = match bind_dual_stack(server_cfg(identity, trust)?, sock) {
-            Ok(ep) => ep,
+        let (mut endpoint, demux, mapped) = match bind_with_demux(server_cfg(identity, trust)?, sock)
+        {
+            Ok((ep, demux)) => (ep, demux, mapped),
             Err(e) => {
                 warn!(error = %e, "dual-stack QUIC bind failed; falling back to 0.0.0.0:0");
-                Endpoint::server(server_cfg(identity, trust)?, "0.0.0.0:0".parse()?)?
+                let v4_sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
+                v4_sock.set_nonblocking(true)?;
+                let (ep, demux) = bind_with_demux(server_cfg(identity, trust)?, v4_sock)?;
+                (ep, demux, None)
             }
         };
         endpoint.set_default_client_config(client_cfg);
@@ -238,10 +332,62 @@ impl QuicEndpoint {
         } else {
             info!(addr = %local_addr, "QUIC bound IPv4-only");
         }
-        Ok((Self { endpoint, local_addr }, mapped))
+        Ok((
+            Self {
+                endpoint,
+                local_addr,
+                demux,
+            },
+            mapped,
+        ))
     }
 
-    /// Returns the link and the authenticated peer device id.
+    /// Asynchronously probe a STUN server over this **live** QUIC UDP socket
+    /// without interrupting active QUIC sessions or blocking Tokio threads.
+    pub async fn probe_stun(&self, server: SocketAddr) -> Result<SocketAddr> {
+        let dest = remote_for_endpoint(self.local_addr, server);
+        for attempt in 1..=3u8 {
+            let mut txn = [0u8; 12];
+            rand::rngs::OsRng.fill_bytes(&mut txn);
+            let req = binding_request(&txn);
+            let rx = self.demux.register_stun(txn);
+            let transmit = Transmit {
+                destination: dest,
+                ecn: None,
+                contents: &req,
+                segment_size: None,
+                src_ip: None,
+            };
+            if let Err(e) = self.demux.try_send(&transmit) {
+                self.demux.unregister_stun(&txn);
+                debug!(attempt, %server, error = %e, "live stun send failed");
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                continue;
+            }
+            match tokio::time::timeout(Duration::from_millis(1500), rx).await {
+                Ok(Ok(mapped)) => {
+                    // Normalize v4-mapped IPv6 addresses returned by dual-stack sockets.
+                    let clean = match mapped {
+                        SocketAddr::V6(v6) => v6
+                            .ip()
+                            .to_ipv4_mapped()
+                            .map(|v4| SocketAddr::new(IpAddr::V4(v4), v6.port()))
+                            .unwrap_or(mapped),
+                        other => other,
+                    };
+                    return Ok(clean);
+                }
+                _ => {
+                    self.demux.unregister_stun(&txn);
+                    debug!(attempt, %server, "live stun probe retry");
+                }
+            }
+        }
+        bail!("no stun reply from {server}")
+    }
+
+    /// Connect to `addr` using native QUIC v2 (ALPN `topaz-v2`) and return the
+    /// link and authenticated peer device id.
     pub async fn connect(&self, addr: SocketAddr) -> Result<(QuicLink, String)> {
         let dest = remote_for_endpoint(self.local_addr, addr);
         let conn = self
@@ -250,17 +396,7 @@ impl QuicEndpoint {
             .await
             .with_context(|| format!("quic connect {addr}"))?;
         let peer = authenticated_peer(&conn)?;
-        let (mut send, recv) = conn.open_bi().await?;
-        // Materialize the QUIC stream immediately so the acceptor's
-        // `accept_bi()` returns even before any mux `Frame::Open` is sent.
-        send.write_all(&[topaz_proto::mux::MUX_VERSION]).await?;
-        Ok((
-            QuicLink {
-                conn,
-                stream: QuicStream { send, recv },
-            },
-            peer,
-        ))
+        Ok((QuicLink { conn }, peer))
     }
 
     pub async fn accept(&self) -> Result<(QuicLink, String)> {
@@ -271,24 +407,7 @@ impl QuicEndpoint {
             .ok_or_else(|| anyhow!("endpoint closed"))?;
         let conn = incoming.await?;
         let peer = authenticated_peer(&conn)?;
-        let (send, recv) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let (send, mut recv) = conn.accept_bi().await?;
-            let mut ver = [0u8; 1];
-            tokio::io::AsyncReadExt::read_exact(&mut recv, &mut ver).await?;
-            if ver[0] != topaz_proto::mux::MUX_VERSION {
-                anyhow::bail!("unsupported mux version {}", ver[0]);
-            }
-            Ok::<_, anyhow::Error>((send, recv))
-        })
-        .await
-        .map_err(|_| anyhow!("timed out waiting for peer control stream"))??;
-        Ok((
-            QuicLink {
-                conn,
-                stream: QuicStream { send, recv },
-            },
-            peer,
-        ))
+        Ok((QuicLink { conn }, peer))
     }
 }
 
@@ -296,6 +415,7 @@ impl QuicEndpoint {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, SocketAddrV4, SocketAddrV6};
+    use topaz_proto::stun::{binding_response, parse_binding_request};
 
     #[test]
     fn maps_v4_remote_onto_v6_endpoint() {
@@ -322,5 +442,32 @@ mod tests {
             remote_for_endpoint(local, remote),
             SocketAddr::from(([192, 168, 1, 8], 80))
         );
+    }
+
+    #[tokio::test]
+    async fn live_quic_endpoint_probes_stun_while_running() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let stun_srv = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stun_addr = stun_srv.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 256];
+            loop {
+                let Ok((n, peer)) = stun_srv.recv_from(&mut buf).await else {
+                    break;
+                };
+                if let Some(txn) = parse_binding_request(&buf[..n]) {
+                    let _ = stun_srv
+                        .send_to(&binding_response(&txn, peer), peer)
+                        .await;
+                }
+            }
+        });
+
+        let id = DeviceIdentity::generate().unwrap();
+        let trust = crate::tls::new_trust_store();
+        let (ep, _) = QuicEndpoint::bind(&id, &trust, None).unwrap();
+        let mapped = ep.probe_stun(stun_addr).await.unwrap();
+        assert_eq!(mapped.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(mapped.port(), ep.local_addr.port());
     }
 }

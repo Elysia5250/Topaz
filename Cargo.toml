@@ -11,13 +11,14 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.85"
 
 [workspace.dependencies]
 anyhow = "1"
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 axum = { version = "0.8", features = ["ws"] }
 blake3 = "1"
 bytes = "1"
@@ -53,3 +54,5 @@ tower-http = { version = "0.6", features = ["trace"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 ratatui = "0.29"
 tokio-tungstenite = "0.26"
+yamux = "0.13"
+zeroize = "1"

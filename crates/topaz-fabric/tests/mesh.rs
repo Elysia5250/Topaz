@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use topaz_core::{generate_recovery_code, issue_cert, AccountKey, DeviceIdentity};
+use topaz_core::{generate_recovery_code, issue_cert, issue_revocation, AccountKey, DeviceIdentity};
 use topaz_fabric::{
     build, EngineDeps, EngineHandle, PeerInfo, PingService, Service, SharedStatus,
 };
@@ -31,7 +31,9 @@ use tokio_rustls::TlsAcceptor;
 struct MockCoord {
     url: String,
     pin: String,
+    entries: Arc<Mutex<Vec<DeviceEntry>>>,
     endpoints: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    force_401_body: Arc<Mutex<Option<String>>>,
 }
 
 impl MockCoord {
@@ -63,9 +65,11 @@ impl MockCoord {
         let entries = Arc::new(Mutex::new(entries));
         let endpoints: Arc<Mutex<HashMap<String, Vec<String>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let force_401_body: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
         let entries_s = entries.clone();
         let endpoints_s = endpoints.clone();
+        let force_401_s = force_401_body.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((tcp, _)) = listener.accept().await else {
@@ -74,6 +78,7 @@ impl MockCoord {
                 let acceptor = acceptor.clone();
                 let entries = entries_s.clone();
                 let endpoints = endpoints_s.clone();
+                let force_401 = force_401_s.clone();
                 tokio::spawn(async move {
                     let Ok(tls) = acceptor.accept(tcp).await else {
                         return;
@@ -81,6 +86,7 @@ impl MockCoord {
                     let svc = service_fn(move |req: Request<Incoming>| {
                         let entries = entries.clone();
                         let endpoints = endpoints.clone();
+                        let force_401 = force_401.clone();
                         async move {
                             let method = req.method().clone();
                             let path = req.uri().path().to_string();
@@ -98,6 +104,11 @@ impl MockCoord {
                                 .unwrap_or_default();
 
                             if method == Method::GET && path == "/v1/devices" {
+                                if let Some(msg) = force_401.lock().unwrap().clone() {
+                                    let mut r = Response::new(Full::new(Bytes::from(msg)));
+                                    *r.status_mut() = StatusCode::UNAUTHORIZED;
+                                    return Ok::<_, hyper::Error>(r);
+                                }
                                 let json =
                                     serde_json::to_vec(&*entries.lock().unwrap()).unwrap();
                                 return Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from(
@@ -112,6 +123,7 @@ impl MockCoord {
                                     observed_ip: "127.0.0.1".into(),
                                     relay: "tcp://127.0.0.1:1".into(),
                                     relay_ws: "wss://127.0.0.1:1/v1/relay".into(),
+                                    relay_quic: String::new(),
                                     stun: String::new(),
                                 };
                                 let json = serde_json::to_vec(&resp).unwrap();
@@ -148,7 +160,9 @@ impl MockCoord {
         Self {
             url: format!("https://127.0.0.1:{}", addr.port()),
             pin,
+            entries,
             endpoints,
+            force_401_body,
         }
     }
 }
@@ -204,7 +218,9 @@ fn spawn_node(
     let relay = RelayAddrs {
         tcp: "127.0.0.1:1".into(),
         ws: "wss://127.0.0.1:1/v1/relay".into(),
+        quic: String::new(),
         coord_tls: client.tls_config(),
+        coord_quic_tls: None,
     };
     let status = Arc::new(SharedStatus::new());
     let st_for_svc = status.clone();
@@ -221,6 +237,8 @@ fn spawn_node(
             signal_rx: sig_in,
             force_relay: false,
             enable_mdns: false,
+            initial_devices: Vec::new(),
+            on_devices_cached: None,
         },
         move |_| {
             vec![
@@ -418,4 +436,124 @@ async fn late_joiner_clears_backoff_and_connects() {
     let node_b = spawn_node(b, user_pubkey, &coord, hub_tx, b_in_rx);
     wait_for_session(&node_a.handle, &node_b.id.device_id).await;
     wait_for_session(&node_b.handle, &node_a.id.device_id).await;
+}
+
+#[tokio::test]
+async fn revoked_peer_direct_session_is_closed_immediately() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let rec = generate_recovery_code();
+    let root = AccountKey::from_recovery(&rec).unwrap();
+    let a = DeviceIdentity::generate().unwrap();
+    let b = DeviceIdentity::generate().unwrap();
+    let (a, b) = if a.device_id < b.device_id {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    let ca = issue_cert(&root.signing, &root.user_id, &root.user_pubkey, &a.pubkey_hex, "a").unwrap();
+    let cb = issue_cert(&root.signing, &root.user_id, &root.user_pubkey, &b.pubkey_hex, "b").unwrap();
+    let coord = MockCoord::start(vec![
+        DeviceEntry::new(ca, None),
+        DeviceEntry::new(cb, None),
+    ])
+    .await;
+
+    let (a_in_tx, a_in_rx) = mpsc::channel(32);
+    let (b_in_tx, b_in_rx) = mpsc::channel(32);
+    let (hub_tx, mut hub_rx) = mpsc::channel::<SignalEnvelope>(64);
+    let a_id = a.device_id.clone();
+    let b_id = b.device_id.clone();
+    tokio::spawn(async move {
+        while let Some(env) = hub_rx.recv().await {
+            if env.to == a_id {
+                let _ = a_in_tx.send(env).await;
+            } else if env.to == b_id {
+                let _ = b_in_tx.send(env).await;
+            }
+        }
+    });
+
+    let node_a = spawn_node(a, root.user_pubkey.clone(), &coord, hub_tx.clone(), a_in_rx);
+    let node_b = spawn_node(b, root.user_pubkey.clone(), &coord, hub_tx, b_in_rx);
+    wait_for_session(&node_a.handle, &node_b.id.device_id).await;
+    wait_for_session(&node_b.handle, &node_a.id.device_id).await;
+
+    // Revoke B via root key in MockCoord, then kick A so it refreshes immediately.
+    let rev_b = issue_revocation(&root.signing, &root.user_id, &node_b.id.device_id);
+    {
+        let mut list = coord.entries.lock().unwrap();
+        for e in list.iter_mut() {
+            if e.cert.device_id == node_b.id.device_id {
+                e.revocation = Some(rev_b.clone());
+            }
+        }
+    }
+    node_a.handle.kick(false);
+
+    // Node A must terminate the existing direct QUIC session to revoked B.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let st = node_a.handle.status();
+            if st.sessions.is_empty() && st.peers.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("node A should close live direct session for revoked peer B");
+
+    assert!(
+        node_a
+            .handle
+            .send_datagram(&node_b.id.device_id, Bytes::from_static(b"blocked"))
+            .is_err(),
+        "datagrams to revoked peer must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn clock_skew_401_does_not_kill_engine() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let (user_pubkey, a, b, entries) = make_account_pair();
+    let coord = MockCoord::start(entries).await;
+
+    let (a_in_tx, a_in_rx) = mpsc::channel(32);
+    let (b_in_tx, b_in_rx) = mpsc::channel(32);
+    let (hub_tx, mut hub_rx) = mpsc::channel::<SignalEnvelope>(64);
+    let a_id = a.device_id.clone();
+    let b_id = b.device_id.clone();
+    tokio::spawn(async move {
+        while let Some(env) = hub_rx.recv().await {
+            if env.to == a_id {
+                let _ = a_in_tx.send(env).await;
+            } else if env.to == b_id {
+                let _ = b_in_tx.send(env).await;
+            }
+        }
+    });
+
+    let node_a = spawn_node(a, user_pubkey.clone(), &coord, hub_tx.clone(), a_in_rx);
+    let node_b = spawn_node(b, user_pubkey, &coord, hub_tx, b_in_rx);
+    wait_for_session(&node_a.handle, &node_b.id.device_id).await;
+
+    // Simulate laptop wake with clock skew: coord returns 401 stale or replayed request.
+    *coord.force_401_body.lock().unwrap() = Some("stale or replayed request".into());
+    node_a.handle.kick(false);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // Engine must stay alive and keep its active session.
+    assert!(!node_a._task.is_finished(), "clock skew must NOT kill engine");
+    assert!(!node_a.handle.status().sessions.is_empty());
+
+    // Now simulate actual server-side revocation 401: engine MUST terminate.
+    *coord.force_401_body.lock().unwrap() = Some("unknown or revoked device".into());
+    node_a.handle.kick(false);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !node_a._task.is_finished() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("real revocation 401 should stop the engine");
 }

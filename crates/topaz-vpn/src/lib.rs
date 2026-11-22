@@ -93,11 +93,13 @@ impl SharedVpnStatus {
 }
 
 /// Spawn the VPN TUN + DNS task. Returns `None` when `cfg.disabled` (`--no-tun`).
+/// Pass `shutdown` so the loop can tear down DNS config cleanly before process exit.
 pub fn spawn(
     engine: EngineHandle,
     status: Arc<SharedStatus>,
     vpn_status: SharedVpnStatus,
     cfg: VpnConfig,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Option<JoinHandle<()>> {
     if cfg.disabled {
         vpn_status.set(VpnStatus {
@@ -115,5 +117,6 @@ pub fn spawn(
         status,
         vpn_status,
         cfg,
+        shutdown,
     )))
 }
